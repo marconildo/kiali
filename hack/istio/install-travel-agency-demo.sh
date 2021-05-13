@@ -3,12 +3,14 @@
 # This deploys the travel agency demo
 
 : ${CLIENT_EXE:=oc}
-: ${NAMESPACE_AGENCY:=travel-agency}
-: ${NAMESPACE_PORTAL:=travel-portal}
-: ${NAMESPACE_CONTROL:=travel-control}
-: ${ENABLE_OPERATION_METRICS:=false}
 : ${DELETE_DEMO:=false}
+: ${ENABLE_INJECTION:=true}
+: ${ENABLE_OPERATION_METRICS:=false}
+: ${NAMESPACE_AGENCY:=travel-agency}
+: ${NAMESPACE_CONTROL:=travel-control}
+: ${NAMESPACE_PORTAL:=travel-portal}
 : ${SHOW_GUI:=false}
+: ${SOURCE:="https://raw.githubusercontent.com/kiali/demos/master"}
 
 while [ $# -gt 0 ]; do
   key="$1"
@@ -21,8 +23,16 @@ while [ $# -gt 0 ]; do
       DELETE_DEMO="$2"
       shift;shift
       ;;
+    -ei|--enable-injection)
+      ENABLE_INJECTION="$2"
+      shift;shift
+      ;;
     -eo|--enable-operation-metrics)
       ENABLE_OPERATION_METRICS="$2"
+      shift;shift
+      ;;
+    -s|--source)
+      SOURCE="$2"
       shift;shift
       ;;
     -sg|--show-gui)
@@ -34,9 +44,11 @@ while [ $# -gt 0 ]; do
 Valid command line arguments:
   -c|--client: either 'oc' or 'kubectl'
   -d|--delete: either 'true' or 'false'. If 'true' the travel agency demo will be deleted, not installed.
-  -eo|--enable-operation-metrics: either 'true' or 'false' (default is false). Only works on Istio 1.7 installed in istio-system.
-  -iv|--install-version: either 'v1' or 'v2' (default is v1)
+  -ei|--enable-injection: either 'true' or 'false' (default is true). If 'true' auto-inject proxies for the workloads.
+  -eo|--enable-operation-metrics: either 'true' or 'false' (default is false). Only works on Istio 1.9 installed in istio-system.
+  -s|--source: demo file source. For example: file:///home/me/demos Default: https://raw.githubusercontent.com/kiali/demos/master
   -sg|--show-gui: do not install anything, but bring up the travel agency GUI in a browser window
+  -h|--help: this text
 HELPMSG
       exit 1
       ;;
@@ -57,25 +69,21 @@ fi
 
 echo Will deploy Travel Agency using these settings:
 echo CLIENT_EXE=${CLIENT_EXE}
-echo NAMESPACE_AGENCY=${NAMESPACE_AGENCY}
-echo NAMESPACE_PORTAL=${NAMESPACE_PORTAL}
-echo NAMESPACE_CONTROL=${NAMESPACE_CONTROL}
+echo DELETE_DEMO=${DELETE_DEMO}
+echo ENABLE_INJECTION=${ENABLE_INJECTION}
 echo ENABLE_OPERATION_METRICS=${ENABLE_OPERATION_METRICS}
+echo NAMESPACE_AGENCY=${NAMESPACE_AGENCY}
+echo NAMESPACE_CONTROL=${NAMESPACE_CONTROL}
+echo NAMESPACE_PORTAL=${NAMESPACE_PORTAL}
+echo SOURCE=${SOURCE}
+
 
 # If we are to delete, remove everything and exit immediately after
 if [ "${DELETE_DEMO}" == "true" ]; then
   echo "Deleting Travel Agency Demo (the envoy filters, if previously created, will remain)"
   if [ "${CLIENT_EXE}" == "oc" ]; then
-    ${CLIENT_EXE} adm policy remove-scc-from-group privileged system:serviceaccounts:${NAMESPACE_AGENCY}
-    ${CLIENT_EXE} adm policy remove-scc-from-group anyuid system:serviceaccounts:${NAMESPACE_AGENCY}
     ${CLIENT_EXE} delete network-attachment-definition istio-cni -n ${NAMESPACE_AGENCY}
-
-    ${CLIENT_EXE} adm policy remove-scc-from-group privileged system:serviceaccounts:${NAMESPACE_PORTAL}
-    ${CLIENT_EXE} adm policy remove-scc-from-group anyuid system:serviceaccounts:${NAMESPACE_PORTAL}
     ${CLIENT_EXE} delete network-attachment-definition istio-cni -n ${NAMESPACE_PORTAL}
-
-    ${CLIENT_EXE} adm policy remove-scc-from-group privileged system:serviceaccounts:${NAMESPACE_CONTROL}
-    ${CLIENT_EXE} adm policy remove-scc-from-group anyuid system:serviceaccounts:${NAMESPACE_CONTROL}
     ${CLIENT_EXE} delete network-attachment-definition istio-cni -n ${NAMESPACE_CONTROL}
   fi
   ${CLIENT_EXE} delete namespace ${NAMESPACE_AGENCY}
@@ -88,10 +96,10 @@ fi
 
 if ! ${CLIENT_EXE} get namespace ${NAMESPACE_AGENCY} 2>/dev/null; then
   ${CLIENT_EXE} create namespace ${NAMESPACE_AGENCY}
-  ${CLIENT_EXE} label namespace ${NAMESPACE_AGENCY} istio-injection=enabled
+  if [ "${ENABLE_INJECTION}" == "true" ]; then
+    ${CLIENT_EXE} label namespace ${NAMESPACE_AGENCY} istio-injection=enabled
+  fi
   if [ "${CLIENT_EXE}" == "oc" ]; then
-    ${CLIENT_EXE} adm policy add-scc-to-group privileged system:serviceaccounts:${NAMESPACE_AGENCY}
-    ${CLIENT_EXE} adm policy add-scc-to-group anyuid system:serviceaccounts:${NAMESPACE_AGENCY}
     cat <<EOF | ${CLIENT_EXE} -n ${NAMESPACE_AGENCY} create -f -
 apiVersion: "k8s.cni.cncf.io/v1"
 kind: NetworkAttachmentDefinition
@@ -103,10 +111,10 @@ fi
 
 if ! ${CLIENT_EXE} get namespace ${NAMESPACE_PORTAL} 2>/dev/null; then
   ${CLIENT_EXE} create namespace ${NAMESPACE_PORTAL}
-  ${CLIENT_EXE} label namespace ${NAMESPACE_PORTAL} istio-injection=enabled
+  if [ "${ENABLE_INJECTION}" == "true" ]; then
+    ${CLIENT_EXE} label namespace ${NAMESPACE_PORTAL} istio-injection=enabled
+  fi
   if [ "${CLIENT_EXE}" == "oc" ]; then
-    ${CLIENT_EXE} adm policy add-scc-to-group privileged system:serviceaccounts:${NAMESPACE_PORTAL}
-    ${CLIENT_EXE} adm policy add-scc-to-group anyuid system:serviceaccounts:${NAMESPACE_PORTAL}
     cat <<EOF | ${CLIENT_EXE} -n ${NAMESPACE_PORTAL} create -f -
 apiVersion: "k8s.cni.cncf.io/v1"
 kind: NetworkAttachmentDefinition
@@ -118,10 +126,10 @@ fi
 
 if ! ${CLIENT_EXE} get namespace ${NAMESPACE_CONTROL} 2>/dev/null; then
   ${CLIENT_EXE} create namespace ${NAMESPACE_CONTROL}
-  ${CLIENT_EXE} label namespace ${NAMESPACE_CONTROL} istio-injection=enabled
+  if [ "${ENABLE_INJECTION}" == "true" ]; then
+    ${CLIENT_EXE} label namespace ${NAMESPACE_CONTROL} istio-injection=enabled
+  fi
   if [ "${CLIENT_EXE}" == "oc" ]; then
-    ${CLIENT_EXE} adm policy add-scc-to-group privileged system:serviceaccounts:${NAMESPACE_CONTROL}
-    ${CLIENT_EXE} adm policy add-scc-to-group anyuid system:serviceaccounts:${NAMESPACE_CONTROL}
     cat <<EOF | ${CLIENT_EXE} -n ${NAMESPACE_CONTROL} create -f -
 apiVersion: "k8s.cni.cncf.io/v1"
 kind: NetworkAttachmentDefinition
@@ -133,9 +141,9 @@ fi
 
 # Deploy the demo
 
-${CLIENT_EXE} apply -f <(curl -L https://raw.githubusercontent.com/kiali/demos/master/travels/travel_agency.yaml) -n ${NAMESPACE_AGENCY}
-${CLIENT_EXE} apply -f <(curl -L https://raw.githubusercontent.com/kiali/demos/master/travels/travel_portal.yaml) -n ${NAMESPACE_PORTAL}
-${CLIENT_EXE} apply -f <(curl -L https://raw.githubusercontent.com/kiali/demos/master/travels/travel_control.yaml) -n ${NAMESPACE_CONTROL}
+${CLIENT_EXE} apply -f <(curl -L "${SOURCE}/travels/travel_agency.yaml") -n ${NAMESPACE_AGENCY}
+${CLIENT_EXE} apply -f <(curl -L "${SOURCE}/travels/travel_portal.yaml") -n ${NAMESPACE_PORTAL}
+${CLIENT_EXE} apply -f <(curl -L "${SOURCE}/travels/travel_control.yaml") -n ${NAMESPACE_CONTROL}
 
 # Set up metric classification
 
@@ -144,33 +152,30 @@ if [ "${ENABLE_OPERATION_METRICS}" != "true" ]; then
   exit 0
 fi
 
-# This only works if you have Istio 1.7 installed, and it is in istio-system namespace.
-${CLIENT_EXE} -n istio-system get envoyfilter stats-filter-1.7 -o yaml > stats-filter-1.7.yaml
-cat <<EOF | patch -o - | ${CLIENT_EXE} -n istio-system apply -f - && rm stats-filter-1.7.yaml
---- stats-filter-1.7.yaml	2020-06-02 11:10:29.476537126 -0400
-+++ stats-filter-1.7.yaml.new	2020-06-02 09:59:26.434300000 -0400
-@@ -79,7 +79,20 @@ spec:
-                 value: |
-                   {
-                     "debug": "false",
--                    "stat_prefix": "istio"
-+                    "stat_prefix": "istio",
-+                    "metrics": [
-+                     {
-+                       "name": "requests_total",
-+                       "dimensions": {
-+                         "request_operation": "istio_operationId"
-+                       }
-+                     },
-+                     {
-+                       "name": "request_duration_milliseconds",
-+                       "dimensions": {
-+                         "request_operation": "istio_operationId"
-+                       }
-+                     }]
+# This only works if you have Istio 1.9 installed, and it is in istio-system namespace.
+${CLIENT_EXE} -n istio-system get envoyfilter stats-filter-1.9 -o yaml > stats-filter-1.9.yaml
+cat <<EOF | patch -o - | ${CLIENT_EXE} -n istio-system apply -f - && rm stats-filter-1.9.yaml
+--- stats-filter-1.9.yaml	2021-01-13 11:54:58.238566005 -0500
++++ stats-filter-1.9.yaml.new	2021-01-13 12:13:12.710918344 -0500
+@@ -117,6 +117,18 @@
+                           "source_cluster": "downstream_peer.cluster_id",
+                           "destination_cluster": "node.metadata['CLUSTER_ID']"
+                         }
++                      },
++                      {
++                        "name": "requests_total",
++                        "dimensions": {
++                          "request_operation": "istio_operationId"
++                        }
++                      },
++                      {
++                        "name": "request_duration_milliseconds",
++                        "dimensions": {
++                          "request_operation": "istio_operationId"
++                        }
+                       }
+                     ]
                    }
-               root_id: stats_inbound
-               vm_config:
 EOF
 
 cat <<EOF | ${CLIENT_EXE} -n istio-system apply -f -
@@ -190,7 +195,7 @@ spec:
             subFilter:
               name: istio.stats
       proxy:
-        proxyVersion: 1\.7.*
+        proxyVersion: 1\.9.*
     patch:
       operation: INSERT_BEFORE
       value:
@@ -242,7 +247,7 @@ spec:
     match:
       context: SIDECAR_INBOUND
       proxy:
-        proxyVersion: '1\.7.*'
+        proxyVersion: '1\.9.*'
       listener:
         filterChain:
           filter:
@@ -296,7 +301,7 @@ spec:
     match:
       context: SIDECAR_INBOUND
       proxy:
-        proxyVersion: '1\.7.*'
+        proxyVersion: '1\.9.*'
       listener:
         filterChain:
           filter:

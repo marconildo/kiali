@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/kiali/kiali/config"
 )
+
+const DefaultTimeout = 10 * time.Second
 
 func HttpMethods() []string {
 	return []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
@@ -24,10 +27,12 @@ func HttpGet(url string, auth *config.Auth, timeout time.Duration) ([]byte, int,
 	if err != nil {
 		return nil, 0, err
 	}
-	transport, err := AuthTransport(auth, &http.Transport{})
+
+	transport, err := CreateTransport(auth, &http.Transport{}, timeout)
 	if err != nil {
 		return nil, 0, err
 	}
+
 	client := http.Client{Transport: transport, Timeout: timeout}
 
 	resp, err := client.Do(req)
@@ -62,7 +67,40 @@ func newAuthRoundTripper(auth *config.Auth, rt http.RoundTripper) http.RoundTrip
 	}
 }
 
-func AuthTransport(auth *config.Auth, transportConfig *http.Transport) (http.RoundTripper, error) {
+// Creates a new HTTP Transport with TLS and Timeouts.
+//
+// Please remember that setting long timeouts is not recommended as it can make
+// idle connections stay open for as long as 2 * timeout. This should only be
+// done in cases where you know the request is very likely going to be reused at
+// some point in the near future.
+func CreateTransport(auth *config.Auth, transportConfig *http.Transport, timeout time.Duration) (http.RoundTripper, error) {
+	// Limits the time spent establishing a TCP connection if a new one is
+	// needed. If DialContext is not set, Dial is used, we only create a new one
+	// if neither is defined.
+	if transportConfig.DialContext == nil {
+		transportConfig.DialContext = (&net.Dialer{
+			Timeout: timeout,
+		}).DialContext
+	}
+
+	transportConfig.IdleConnTimeout = timeout
+
+	if auth == nil {
+		return transportConfig, nil
+	}
+
+	tlscfg, err := GetTLSConfig(auth)
+	if err != nil {
+		return nil, err
+	}
+	if tlscfg != nil {
+		transportConfig.TLSClientConfig = tlscfg
+	}
+
+	return newAuthRoundTripper(auth, transportConfig), nil
+}
+
+func GetTLSConfig(auth *config.Auth) (*tls.Config, error) {
 	if auth.InsecureSkipVerify || auth.CAFile != "" {
 		var certPool *x509.CertPool
 		if auth.CAFile != "" {
@@ -77,14 +115,12 @@ func AuthTransport(auth *config.Auth, transportConfig *http.Transport) (http.Rou
 				return nil, fmt.Errorf("supplied CA file could not be parsed")
 			}
 		}
-
-		transportConfig.TLSClientConfig = &tls.Config{
+		return &tls.Config{
 			InsecureSkipVerify: auth.InsecureSkipVerify,
 			RootCAs:            certPool,
-		}
+		}, nil
 	}
-
-	return newAuthRoundTripper(auth, transportConfig), nil
+	return nil, nil
 }
 
 func GuessKialiURL(r *http.Request) string {
@@ -126,7 +162,9 @@ func GuessKialiURL(r *http.Request) string {
 	// priority, because this is the port where the pod is listening, which may
 	// be mapped to another public port via the Service/Ingress. So, HTTP headers
 	// take priority.
-	if fwdPort, ok := r.Header["X-Forwarded-Port"]; ok && len(fwdPort) == 1 {
+	if len(cfg.Server.WebPort) > 0 {
+		port = cfg.Server.WebPort
+	} else if fwdPort, ok := r.Header["X-Forwarded-Port"]; ok && len(fwdPort) == 1 {
 		port = fwdPort[0]
 	} else if len(r.URL.Host) != 0 {
 		if len(r.URL.Port()) != 0 {
@@ -147,5 +185,5 @@ func GuessKialiURL(r *http.Request) string {
 		guessedKialiURL = fmt.Sprintf("%s://%s:%s%s", schema, host, port, cfg.Server.WebRoot)
 	}
 
-	return guessedKialiURL
+	return strings.TrimRight(guessedKialiURL, "/")
 }

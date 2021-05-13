@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/common/model"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
@@ -27,13 +28,15 @@ const (
 )
 
 const (
-	GroupByApp                string = "app"
-	GroupByNone               string = "none"
-	GroupByVersion            string = "version"
+	BoxByApp                  string = "app"
+	BoxByCluster              string = "cluster"
+	BoxByNamespace            string = "namespace"
+	BoxByNone                 string = "none"
 	NamespaceIstio            string = "istio-system"
+	defaultBoxBy              string = BoxByNone
 	defaultDuration           string = "10m"
 	defaultGraphType          string = GraphTypeWorkload
-	defaultGroupBy            string = GroupByNone
+	defaultIncludeIdleEdges   bool   = false
 	defaultInjectServiceNodes bool   = false
 )
 
@@ -47,6 +50,7 @@ type NodeOptions struct {
 	Aggregate      string
 	AggregateValue string
 	App            string
+	Cluster        string
 	Namespace      string
 	Service        string
 	Version        string
@@ -63,7 +67,7 @@ type CommonOptions struct {
 
 // ConfigOptions are those supplied to Config Vendors
 type ConfigOptions struct {
-	GroupBy string
+	BoxBy string
 	CommonOptions
 }
 
@@ -76,6 +80,7 @@ type RequestedAppenders struct {
 type TelemetryOptions struct {
 	AccessibleNamespaces map[string]time.Time
 	Appenders            RequestedAppenders // requested appenders, nil if param not supplied
+	IncludeIdleEdges     bool               // include edges with request rates of 0
 	InjectServiceNodes   bool               // inject destination service nodes between source and destination nodes.
 	Namespaces           NamespaceInfoMap
 	CommonOptions
@@ -104,13 +109,16 @@ func NewOptions(r *net_http.Request) Options {
 	// query params
 	params := r.URL.Query()
 	var duration model.Duration
+	var includeIdleEdges bool
 	var injectServiceNodes bool
 	var queryTime int64
 	appenders := RequestedAppenders{All: true}
+	boxBy := params.Get("boxBy")
+	cluster := params.Get("cluster")
 	configVendor := params.Get("configVendor")
 	durationString := params.Get("duration")
 	graphType := params.Get("graphType")
-	groupBy := params.Get("groupBy")
+	includeIdleEdgesString := params.Get("includeIdleEdges")
 	injectServiceNodesString := params.Get("injectServiceNodes")
 	namespaces := params.Get("namespaces") // csl of namespaces
 	queryTimeString := params.Get("queryTime")
@@ -124,6 +132,9 @@ func NewOptions(r *net_http.Request) Options {
 		appenders = RequestedAppenders{All: false, AppenderNames: appenderNames}
 	}
 
+	if cluster == "" {
+		cluster = Unknown
+	}
 	if configVendor == "" {
 		configVendor = defaultConfigVendor
 	} else if configVendor != VendorCytoscape {
@@ -147,10 +158,30 @@ func NewOptions(r *net_http.Request) Options {
 	if app != "" && graphType != GraphTypeApp && graphType != GraphTypeVersionedApp {
 		BadRequest(fmt.Sprintf("Invalid graphType [%s]. This node detail graph supports only graphType app or versionedApp.", graphType))
 	}
-	if groupBy == "" {
-		groupBy = defaultGroupBy
-	} else if groupBy != GroupByApp && groupBy != GroupByNone && groupBy != GroupByVersion {
-		BadRequest(fmt.Sprintf("Invalid groupBy [%s]", groupBy))
+	if boxBy == "" {
+		boxBy = defaultBoxBy
+	} else {
+		for _, box := range strings.Split(boxBy, ",") {
+			switch strings.TrimSpace(box) {
+			case BoxByApp:
+				continue
+			case BoxByCluster:
+				continue
+			case BoxByNamespace:
+				continue
+			default:
+				BadRequest(fmt.Sprintf("Invalid boxBy [%s]", boxBy))
+			}
+		}
+	}
+	if includeIdleEdgesString == "" {
+		includeIdleEdges = defaultIncludeIdleEdges
+	} else {
+		var includeIdleEdgesErr error
+		includeIdleEdges, includeIdleEdgesErr = strconv.ParseBool(includeIdleEdgesString)
+		if includeIdleEdgesErr != nil {
+			BadRequest(fmt.Sprintf("Invalid includeIdleEdges [%s]", includeIdleEdgesString))
+		}
 	}
 	if injectServiceNodesString == "" {
 		injectServiceNodes = defaultInjectServiceNodes
@@ -179,19 +210,19 @@ func NewOptions(r *net_http.Request) Options {
 	// Process namespaces options:
 	namespaceMap := NewNamespaceInfoMap()
 
-	tokenContext := r.Context().Value("token")
-	var token string
-	if tokenContext != nil {
-		if tokenString, ok := tokenContext.(string); !ok {
-			Error("token is not of type string")
+	authInfoContext := r.Context().Value("authInfo")
+	var authInfo *api.AuthInfo
+	if authInfoContext != nil {
+		if authInfoCheck, ok := authInfoContext.(*api.AuthInfo); !ok {
+			Error("authInfo is not of type *api.AuthInfo")
 		} else {
-			token = tokenString
+			authInfo = authInfoCheck
 		}
 	} else {
 		Error("token missing in request context")
 	}
 
-	accessibleNamespaces := getAccessibleNamespaces(token)
+	accessibleNamespaces := getAccessibleNamespaces(authInfo)
 
 	// If path variable is set then it is the only relevant namespace (it's a node graph)
 	// Else if namespaces query param is set it specifies the relevant namespaces
@@ -226,7 +257,7 @@ func NewOptions(r *net_http.Request) Options {
 		ConfigVendor:    configVendor,
 		TelemetryVendor: telemetryVendor,
 		ConfigOptions: ConfigOptions{
-			GroupBy: groupBy,
+			BoxBy: boxBy,
 			CommonOptions: CommonOptions{
 				Duration:  time.Duration(duration),
 				GraphType: graphType,
@@ -237,6 +268,7 @@ func NewOptions(r *net_http.Request) Options {
 		TelemetryOptions: TelemetryOptions{
 			AccessibleNamespaces: accessibleNamespaces,
 			Appenders:            appenders,
+			IncludeIdleEdges:     includeIdleEdges,
 			InjectServiceNodes:   injectServiceNodes,
 			Namespaces:           namespaceMap,
 			CommonOptions: CommonOptions{
@@ -249,6 +281,7 @@ func NewOptions(r *net_http.Request) Options {
 				Aggregate:      aggregate,
 				AggregateValue: aggregateValue,
 				App:            app,
+				Cluster:        cluster,
 				Namespace:      namespace,
 				Service:        service,
 				Version:        version,
@@ -275,9 +308,9 @@ func (o *TelemetryOptions) GetGraphKind() string {
 // The Set is implemented using the map convention. Each map entry is set to the
 // creation timestamp of the namespace, to be used to ensure valid time ranges for
 // queries against the namespace.
-func getAccessibleNamespaces(token string) map[string]time.Time {
+func getAccessibleNamespaces(authInfo *api.AuthInfo) map[string]time.Time {
 	// Get the namespaces
-	business, err := business.Get(token)
+	business, err := business.Get(authInfo)
 	CheckError(err)
 
 	namespaces, err := business.Namespace.GetNamespaces()

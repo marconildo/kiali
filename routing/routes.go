@@ -373,6 +373,31 @@ func NewRoutes() (r *Routes) {
 			handlers.ServiceDetails,
 			true,
 		},
+		// swagger:route PATCH /namespaces/{namespace}/services/{service} services serviceUpdate
+		// ---
+		// Endpoint to update the Service configuration using Json Merge Patch strategy.
+		//
+		//     Consumes:
+		//	   - application/json
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      400: badRequestError
+		//      404: notFoundError
+		//      500: internalError
+		//      200: serviceDetailsResponse
+		//
+		{
+			"ServiceUpdate",
+			"PATCH",
+			"/api/namespaces/{namespace}/services/{service}",
+			handlers.ServiceUpdate,
+			true,
+		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/spans traces appSpans
 		// ---
 		// Endpoint to get Jaeger spans for a given app
@@ -1279,6 +1304,48 @@ func NewRoutes() (r *Routes) {
 			handlers.PodLogs,
 			true,
 		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump pods podProxyDump
+		// ---
+		// Endpoint to get pod proxy dump
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      500: internalError
+		//      404: notFoundError
+		//      200: configDump
+		//
+		{
+			"PodConfigDump",
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/config_dump",
+			handlers.ConfigDump,
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump/{resource} pods podProxyResource
+		// ---
+		// Endpoint to get pod logs
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      500: internalError
+		//      404: notFoundError
+		//      200: configDumpResource
+		//
+		{
+			"PodConfigDump",
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/config_dump/{resource}",
+			handlers.ConfigDumpResourceEntries,
+			true,
+		},
 		// swagger:route GET /iter8
 		// ---
 		// Endpoint to check if iter8 adapter is present in the cluster and if user can write adapter config
@@ -1431,6 +1498,46 @@ func NewRoutes() (r *Routes) {
 			"GET",
 			"/api/iter8/namespaces/{namespace}/experiments/{name}/yaml",
 			handlers.Iter8ExperimentGetYaml,
+			true,
+		},
+
+		// swagger:route POST /stats/metrics stats metricsStats
+		// ---
+		// Produces metrics statistics
+		//
+		// 		Produces:
+		//		- application/json
+		//
+		//		Schemes: http, https
+		//
+		// responses:
+		//    400: badRequestError
+		//    503: serviceUnavailableError
+		//		500: internalError
+		//		200: metricsStatsResponse
+		{
+			Name:          "MetricsStats",
+			Method:        "POST",
+			Pattern:       "/api/stats/metrics",
+			HandlerFunc:   handlers.MetricsStats,
+			Authenticated: true,
+		},
+		// swagger:route GET /api/clusters
+		// ---
+		// Endpoint to get the list of the clusters that are hosting the service mesh.
+		//              Produces:
+		//              - application/json
+		//
+		//              Schemes: http, https
+		//
+		// responses:
+		//              500: internalError
+		//              200: clustersResponse
+		{
+			"GetClusters",
+			"GET",
+			"/api/clusters",
+			handlers.GetClusters,
 			true,
 		},
 	}

@@ -3,7 +3,8 @@ package handlers
 import (
 	"errors"
 	"net/http"
-	"net/url"
+
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/log"
@@ -15,26 +16,37 @@ type promClientSupplier func() (*prometheus.Client, error)
 
 var defaultPromClientSupplier = prometheus.NewClient
 
-func validateURL(serviceURL string) (*url.URL, error) {
-	return url.ParseRequestURI(serviceURL)
+func checkNamespaceAccess(nsServ business.NamespaceService, namespace string) (*models.Namespace, error) {
+	if nsInfo, err := nsServ.GetNamespace(namespace); err != nil {
+		return nil, err
+	} else {
+		return nsInfo, nil
+	}
 }
 
-func checkNamespaceAccess(w http.ResponseWriter, r *http.Request, prom prometheus.ClientInterface, namespace string) *models.Namespace {
+func createMetricsServiceForNamespace(w http.ResponseWriter, r *http.Request, promSupplier promClientSupplier, namespace string) (*business.MetricsService, *models.Namespace) {
+	metrics, infoMap := createMetricsServiceForNamespaces(w, r, promSupplier, []string{namespace})
+	if result, ok := infoMap[namespace]; ok {
+		if result.err != nil {
+			RespondWithError(w, http.StatusForbidden, "Cannot access namespace data: "+result.err.Error())
+			return nil, nil
+		}
+		return metrics, result.info
+	}
+	return nil, nil
+}
+
+type nsInfoError struct {
+	info *models.Namespace
+	err  error
+}
+
+func createMetricsServiceForNamespaces(w http.ResponseWriter, r *http.Request, promSupplier promClientSupplier, namespaces []string) (*business.MetricsService, map[string]nsInfoError) {
 	layer, err := getBusiness(r)
 	if err != nil {
 		RespondWithError(w, http.StatusInternalServerError, err.Error())
-		return nil
+		return nil, nil
 	}
-
-	if nsInfo, err := layer.Namespace.GetNamespace(namespace); err != nil {
-		RespondWithError(w, http.StatusForbidden, "Cannot access namespace data: "+err.Error())
-		return nil
-	} else {
-		return nsInfo
-	}
-}
-
-func initClientsForMetrics(w http.ResponseWriter, r *http.Request, promSupplier promClientSupplier, namespace string) (*prometheus.Client, *models.Namespace) {
 	prom, err := promSupplier()
 	if err != nil {
 		log.Error(err)
@@ -42,33 +54,35 @@ func initClientsForMetrics(w http.ResponseWriter, r *http.Request, promSupplier 
 		return nil, nil
 	}
 
-	nsInfo := checkNamespaceAccess(w, r, prom, namespace)
-	if nsInfo == nil {
-		return nil, nil
+	nsInfos := make(map[string]nsInfoError)
+	for _, ns := range namespaces {
+		info, err := checkNamespaceAccess(layer.Namespace, ns)
+		nsInfos[ns] = nsInfoError{info: info, err: err}
 	}
-	return prom, nsInfo
+	metrics := business.NewMetricsService(prom)
+	return metrics, nsInfos
 }
 
-// getToken retrieves the token from the request's context
-func getToken(r *http.Request) (string, error) {
-	tokenContext := r.Context().Value("token")
-	if tokenContext != nil {
-		if token, ok := tokenContext.(string); ok {
-			return token, nil
+// getAuthInfo retrieves the token from the request's context
+func getAuthInfo(r *http.Request) (*api.AuthInfo, error) {
+	authInfoContext := r.Context().Value("authInfo")
+	if authInfoContext != nil {
+		if authInfo, ok := authInfoContext.(*api.AuthInfo); ok {
+			return authInfo, nil
 		} else {
-			return "", errors.New("token is not of type string")
+			return nil, errors.New("authInfo is not of type *api.AuthInfo")
 		}
 	} else {
-		return "", errors.New("token missing from the request context")
+		return nil, errors.New("authInfo missing from the request context")
 	}
 }
 
 // getBusiness returns the business layer specific to the users's request
 func getBusiness(r *http.Request) (*business.Layer, error) {
-	token, err := getToken(r)
+	authInfo, err := getAuthInfo(r)
 	if err != nil {
 		return nil, err
 	}
 
-	return business.Get(token)
+	return business.Get(authInfo)
 }

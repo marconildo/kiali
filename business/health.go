@@ -13,7 +13,6 @@ import (
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/prometheus"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
-	"github.com/kiali/kiali/status"
 )
 
 // HealthService deals with fetching health from various sources and convert to kiali model
@@ -22,6 +21,9 @@ type HealthService struct {
 	k8s           kubernetes.ClientInterface
 	businessLayer *Layer
 }
+
+// Annotation Filter for Health
+var HealthAnnotation = []models.AnnotationKey{models.RateHealthAnnotation}
 
 // GetServiceHealth returns a service health (service request error rate)
 func (in *HealthService) GetServiceHealth(namespace, service, rateInterval string, queryTime time.Time) (models.ServiceHealth, error) {
@@ -99,17 +101,6 @@ func (in *HealthService) GetWorkloadHealth(namespace, workload, workloadType, ra
 			WorkloadStatus: status,
 			Requests:       models.NewEmptyRequestHealth(),
 		}, nil
-	}
-
-	// Add Proxy Status info
-	if w.Pods != nil || len(w.Pods) > 0 {
-		syncedProxies := int32(0)
-		for _, p := range w.Pods {
-			if p.ProxyStatus != nil && p.ProxyStatus.IsSynced() {
-				syncedProxies++
-			}
-		}
-		status.SyncedProxies = syncedProxies
 	}
 
 	// Add Telemetry info
@@ -200,6 +191,7 @@ func (in *HealthService) getNamespaceServiceHealth(namespace string, services []
 	// Prepare all data (note that it's important to provide data for all services, even those which may not have any health, for overview cards)
 	for _, service := range services {
 		h := models.EmptyServiceHealth()
+		h.Requests.HealthAnnotations = models.GetHealthAnnotation(service.Annotations, HealthAnnotation)
 		allHealth[service.Name] = &h
 	}
 
@@ -213,7 +205,9 @@ func (in *HealthService) getNamespaceServiceHealth(namespace string, services []
 			health.Requests.AggregateInbound(sample)
 		}
 	}
-
+	for _, health := range allHealth {
+		health.Requests.CombineReporters()
+	}
 	return allHealth
 }
 
@@ -238,6 +232,7 @@ func (in *HealthService) getNamespaceWorkloadHealth(namespace string, ws models.
 	allHealth := make(models.NamespaceWorkloadHealth)
 	for _, w := range ws {
 		allHealth[w.Name] = models.EmptyWorkloadHealth()
+		allHealth[w.Name].Requests.HealthAnnotations = models.GetHealthAnnotation(w.HealthAnnotations, HealthAnnotation)
 		allHealth[w.Name].WorkloadStatus = w.CastWorkloadStatus()
 		if w.IstioSidecar {
 			hasSidecar = true
@@ -258,12 +253,8 @@ func (in *HealthService) getNamespaceWorkloadHealth(namespace string, ws models.
 
 // fillAppRequestRates aggregates requests rates from metrics fetched from Prometheus, and stores the result in the health map.
 func fillAppRequestRates(allHealth models.NamespaceAppHealth, rates model.Vector) {
-	lblDest := model.LabelName("destination_app")
-	lblSrc := model.LabelName("source_app")
-	if status.AreCanonicalMetricsAvailable() {
-		lblDest = model.LabelName("destination_canonical_service")
-		lblSrc = model.LabelName("source_canonical_service")
-	}
+	lblDest := model.LabelName("destination_canonical_service")
+	lblSrc := model.LabelName("source_canonical_service")
 
 	for _, sample := range rates {
 		name := string(sample.Metric[lblDest])
@@ -274,6 +265,9 @@ func fillAppRequestRates(allHealth models.NamespaceAppHealth, rates model.Vector
 		if health, ok := allHealth[name]; ok {
 			health.Requests.AggregateOutbound(sample)
 		}
+	}
+	for _, health := range allHealth {
+		health.Requests.CombineReporters()
 	}
 }
 
@@ -291,14 +285,26 @@ func fillWorkloadRequestRates(allHealth models.NamespaceWorkloadHealth, rates mo
 			health.Requests.AggregateOutbound(sample)
 		}
 	}
+	for _, health := range allHealth {
+		health.Requests.CombineReporters()
+	}
 }
 
 func (in *HealthService) getServiceRequestsHealth(namespace, service, rateInterval string, queryTime time.Time) (models.RequestHealth, error) {
 	rqHealth := models.NewEmptyRequestHealth()
 	inbound, err := in.prom.GetServiceRequestRates(namespace, service, rateInterval, queryTime)
+	if err != nil {
+		return rqHealth, err
+	}
 	for _, sample := range inbound {
 		rqHealth.AggregateInbound(sample)
 	}
+	svc, err := in.businessLayer.Svc.getService(namespace, service)
+	if err != nil {
+		return rqHealth, err
+	}
+	rqHealth.HealthAnnotations = models.GetHealthAnnotation(svc.Annotations, HealthAnnotation)
+	rqHealth.CombineReporters()
 	return rqHealth, err
 }
 
@@ -311,17 +317,29 @@ func (in *HealthService) getAppRequestsHealth(namespace, app, rateInterval strin
 	for _, sample := range outbound {
 		rqHealth.AggregateOutbound(sample)
 	}
+	rqHealth.CombineReporters()
 	return rqHealth, err
 }
 
 func (in *HealthService) getWorkloadRequestsHealth(namespace, workload, rateInterval string, queryTime time.Time) (models.RequestHealth, error) {
 	rqHealth := models.NewEmptyRequestHealth()
 	inbound, outbound, err := in.prom.GetWorkloadRequestRates(namespace, workload, rateInterval, queryTime)
+	if err != nil {
+		return rqHealth, err
+	}
 	for _, sample := range inbound {
 		rqHealth.AggregateInbound(sample)
 	}
 	for _, sample := range outbound {
 		rqHealth.AggregateOutbound(sample)
 	}
+	w, err := in.businessLayer.Workload.GetWorkload(namespace, workload, "", false)
+	if err != nil {
+		return rqHealth, err
+	}
+	if len(w.Pods) > 0 {
+		rqHealth.HealthAnnotations = models.GetHealthAnnotation(w.HealthAnnotations, HealthAnnotation)
+	}
+	rqHealth.CombineReporters()
 	return rqHealth, err
 }

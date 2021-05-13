@@ -4,17 +4,19 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	kmodel "github.com/kiali/k-charted/model"
+	"github.com/nitishm/engarde/pkg/parser"
 	osapps_v1 "github.com/openshift/api/apps/v1"
 	apps_v1 "k8s.io/api/apps/v1"
 	batch_v1 "k8s.io/api/batch/v1"
 	batch_v1beta1 "k8s.io/api/batch/v1beta1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/kiali/kiali/config"
@@ -25,24 +27,38 @@ import (
 	"github.com/kiali/kiali/prometheus/internalmetrics"
 )
 
-// Workload deals with fetching istio/kubernetes workloads related content and convert to kiali model
+// WorkloadService deals with fetching istio/kubernetes workloads related content and convert to kiali model
 type WorkloadService struct {
 	prom          prometheus.ClientInterface
 	k8s           kubernetes.ClientInterface
 	businessLayer *Layer
 }
 
-// Structures for workload log messages
+// PodLog reports log entries
 type PodLog struct {
-	Logs    string     `json:"logs,omitempty"`
 	Entries []LogEntry `json:"entries,omitempty"`
 }
 
-type LogEntry struct {
-	Message       string `json:"message,omitempty"`
-	Severity      string `json:"severity,omitempty"`
+// AccessLogEntry provides parsed info from a single proxy access log entry
+type AccessLogEntry struct {
 	Timestamp     string `json:"timestamp,omitempty"`
 	TimestampUnix int64  `json:"timestampUnix,omitempty"`
+}
+
+// LogEntry holds a single log entry
+type LogEntry struct {
+	Message       string            `json:"message,omitempty"`
+	Severity      string            `json:"severity,omitempty"`
+	Timestamp     string            `json:"timestamp,omitempty"`
+	TimestampUnix int64             `json:"timestampUnix,omitempty"`
+	AccessLog     *parser.AccessLog `json:"accessLog,omitempty"`
+}
+
+// LogOptions holds query parameter values
+type LogOptions struct {
+	Duration *time.Duration
+	IsProxy  bool // fetching logs for Istio Proxy (Envoy access log)
+	core_v1.PodLogOptions
 }
 
 var (
@@ -95,7 +111,7 @@ func (in *WorkloadService) GetWorkload(namespace string, workloadName string, wo
 		return nil, err
 	}
 
-	var runtimes []kmodel.Runtime
+	var runtimes []models.Runtime
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
@@ -103,8 +119,7 @@ func (in *WorkloadService) GetWorkload(namespace string, workloadName string, wo
 		conf := config.Get()
 		app := workload.Labels[conf.IstioLabels.AppLabelName]
 		version := workload.Labels[conf.IstioLabels.VersionLabelName]
-		dash := NewDashboardsService(in.prom)
-		runtimes = dash.GetCustomDashboardRefs(namespace, app, version, workload.Pods)
+		runtimes = NewDashboardsService().GetCustomDashboardRefs(namespace, app, version, workload.Pods)
 	}()
 
 	if includeServices {
@@ -189,15 +204,74 @@ func (in *WorkloadService) GetPod(namespace, name string) (*models.Pod, error) {
 	return &pod, nil
 }
 
-func (in *WorkloadService) getParsedLogs(namespace, name string, opts *core_v1.PodLogOptions) (*PodLog, error) {
-	podLog, err := in.k8s.GetPodLogs(namespace, name, opts)
+func (in *WorkloadService) BuildLogOptionsCriteria(container, duration, isProxy, sinceTime, tailLines string) (*LogOptions, error) {
+	opts := &LogOptions{}
+	opts.PodLogOptions = core_v1.PodLogOptions{Timestamps: true}
+
+	if container != "" {
+		opts.Container = container
+	}
+
+	if duration != "" {
+		duration, err := time.ParseDuration(duration)
+
+		if err != nil {
+			return nil, fmt.Errorf("Invalid duration [%s]: %v", duration, err)
+		}
+
+		opts.Duration = &duration
+	}
+
+	opts.IsProxy = isProxy == "true"
+
+	if sinceTime != "" {
+		numTime, err := strconv.ParseInt(sinceTime, 10, 64)
+
+		if err != nil {
+			return nil, fmt.Errorf("Invalid sinceTime [%s]: %v", sinceTime, err)
+		}
+
+		opts.SinceTime = &meta_v1.Time{Time: time.Unix(numTime, 0)}
+	}
+
+	if tailLines != "" {
+		if numLines, err := strconv.ParseInt(tailLines, 10, 64); err == nil {
+			if numLines > 0 {
+				opts.TailLines = &numLines
+			}
+		} else {
+			return nil, fmt.Errorf("Invalid tailLines [%s]: %v", tailLines, err)
+		}
+	}
+
+	return opts, nil
+}
+
+func (in *WorkloadService) getParsedLogs(namespace, name string, opts *LogOptions) (*PodLog, error) {
+	k8sOpts := opts.PodLogOptions
+	// the k8s API does not support "endTime/beforeTime". So for bounded time ranges we need to
+	// 1) discard the logs after sinceTime+duration
+	// 2) manually apply tailLines to the remaining logs
+	isBounded := opts.Duration != nil
+	tailLines := k8sOpts.TailLines
+	if isBounded {
+		k8sOpts.TailLines = nil
+	}
+
+	podLog, err := in.k8s.GetPodLogs(namespace, name, &k8sOpts)
 
 	if err != nil {
 		return nil, err
 	}
 
 	lines := strings.Split(podLog.Logs, "\n")
-	messages := make([]LogEntry, 0)
+	entries := make([]LogEntry, 0)
+
+	var startTime *time.Time
+	var endTime *time.Time
+	if k8sOpts.SinceTime != nil {
+		startTime = &k8sOpts.SinceTime.Time
+	}
 
 	for _, line := range lines {
 		entry := LogEntry{
@@ -222,10 +296,28 @@ func (in *WorkloadService) getParsedLogs(namespace, name string, opts *core_v1.P
 		}
 
 		entry.Message = strings.TrimSpace(splitted[1])
+		if entry.Message == "" {
+			log.Debugf("Skipping empty log line [%s]", line)
+			continue
+		}
 
-		parsed, err := time.Parse(time.RFC3339, entry.Timestamp)
+		// If we are past the requested time window then stop processing
+		parsedTimestamp, err := time.Parse(time.RFC3339, entry.Timestamp)
 		if err == nil {
-			entry.TimestampUnix = parsed.Unix()
+			if startTime == nil {
+				startTime = &parsedTimestamp
+			}
+
+			if isBounded {
+				if endTime == nil {
+					end := parsedTimestamp.Add(*opts.Duration)
+					endTime = &end
+				}
+
+				if parsedTimestamp.After(*endTime) {
+					break
+				}
+			}
 		} else {
 			log.Debugf("Failed to parse log timestamp (skipping) [%s], %s", entry.Timestamp, err.Error())
 			continue
@@ -236,18 +328,57 @@ func (in *WorkloadService) getParsedLogs(namespace, name string, opts *core_v1.P
 			entry.Severity = strings.ToUpper(severity)
 		}
 
-		messages = append(messages, entry)
+		// If this is an istio access log, then parse it out. Prefer the access log time over the k8s time
+		// as it is the actual time as opposed to the k8s store time.
+		if opts.IsProxy {
+			engardeParser := parser.New(parser.IstioProxyAccessLogsPattern)
+			al, err := engardeParser.Parse(entry.Message)
+			if err == nil {
+				entry.AccessLog = al
+				t, err := time.Parse(time.RFC3339, al.Timestamp)
+				if err == nil {
+					parsedTimestamp = t
+				}
+
+				// clear accessLog fields we don't need in the returned JSON
+				entry.AccessLog.MixerStatus = ""
+				entry.AccessLog.OriginalMessage = ""
+				entry.AccessLog.ParseError = ""
+			} else {
+				log.Debugf("AccessLog parse failure: %s", err.Error())
+				// try to parse out the time manually
+				tokens := strings.SplitN(entry.Message, " ", 2)
+				timestampToken := strings.Trim(tokens[0], "[]")
+				t, err := time.Parse(time.RFC3339, timestampToken)
+				if err == nil {
+					parsedTimestamp = t
+				}
+			}
+		}
+
+		// override the timestamp with a simpler format
+		timestamp := fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d",
+			parsedTimestamp.Year(), parsedTimestamp.Month(), parsedTimestamp.Day(),
+			parsedTimestamp.Hour(), parsedTimestamp.Minute(), parsedTimestamp.Second())
+		entry.Timestamp = timestamp
+		entry.TimestampUnix = parsedTimestamp.Unix()
+
+		entries = append(entries, entry)
+	}
+
+	if isBounded && tailLines != nil && len(entries) > int(*tailLines) {
+		entries = entries[len(entries)-int(*tailLines):]
 	}
 
 	message := PodLog{
-		Logs:    podLog.Logs,
-		Entries: messages,
+		Entries: entries,
 	}
 
 	return &message, err
 }
 
-func (in *WorkloadService) GetPodLogs(namespace, name string, opts *core_v1.PodLogOptions) (*PodLog, error) {
+// GetPodLogs returns pod logs given the provided options
+func (in *WorkloadService) GetPodLogs(namespace, name string, opts *LogOptions) (*PodLog, error) {
 	return in.getParsedLogs(namespace, name, opts)
 }
 
@@ -260,6 +391,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 	var fulset []apps_v1.StatefulSet
 	var jbs []batch_v1.Job
 	var conjbs []batch_v1beta1.CronJob
+	var daeset []apps_v1.DaemonSet
 
 	ws := models.Workloads{}
 
@@ -270,8 +402,8 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(8)
-	errChan := make(chan error, 8)
+	wg.Add(9)
+	errChan := make(chan error, 9)
 
 	go func() {
 		defer wg.Done()
@@ -385,6 +517,21 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		}
 	}()
 
+	go func() {
+		defer wg.Done()
+		var err error
+		if isWorkloadIncluded(kubernetes.DaemonSetType) {
+			if IsNamespaceCached(namespace) {
+				daeset, err = kialiCache.GetDaemonSets(namespace)
+			} else {
+				daeset, err = layer.k8s.GetDaemonSets(namespace)
+			}
+			if err != nil {
+				log.Errorf("Error fetching DaemonSets per namespace %s: %s", namespace, err)
+			}
+		}
+	}()
+
 	wg.Wait()
 	if len(errChan) != 0 {
 		err := <-errChan
@@ -420,7 +567,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 	// Resolve ReplicationControllers from DeploymentConfigs
 	// Resolve Jobs from CronJobs
 	for cname, ctype := range controllers {
-		if ctype == "ReplicaSet" {
+		if ctype == kubernetes.ReplicaSetType {
 			found := false
 			iFound := -1
 			for i, rs := range repset {
@@ -446,7 +593,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				}
 			}
 		}
-		if ctype == "ReplicationController" {
+		if ctype == kubernetes.ReplicationControllerType {
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
@@ -472,7 +619,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				}
 			}
 		}
-		if ctype == "Job" {
+		if ctype == kubernetes.JobType {
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
@@ -565,6 +712,15 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			controllers[fs.Name] = "StatefulSet"
 		}
 	}
+	for _, ds := range daeset {
+		selectorCheck := true
+		if selector != nil {
+			selectorCheck = selector.Matches(labels.Set(ds.Spec.Template.Labels))
+		}
+		if _, exist := controllers[ds.Name]; !exist && selectorCheck {
+			controllers[ds.Name] = "DaemonSet"
+		}
+	}
 
 	// Build workloads from controllers
 	var cnames []string
@@ -581,7 +737,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		// Flag to add a controller if it is found
 		cnFound := true
 		switch ctype {
-		case "Deployment":
+		case kubernetes.DeploymentType:
 			found := false
 			iFound := -1
 			for i, dp := range dep {
@@ -599,7 +755,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as Deployment", cname)
 				cnFound = false
 			}
-		case "ReplicaSet":
+		case kubernetes.ReplicaSetType:
 			found := false
 			iFound := -1
 			for i, rs := range repset {
@@ -617,7 +773,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as ReplicaSet", cname)
 				cnFound = false
 			}
-		case "ReplicationController":
+		case kubernetes.ReplicationControllerType:
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
@@ -635,7 +791,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as ReplicationController", cname)
 				cnFound = false
 			}
-		case "DeploymentConfig":
+		case kubernetes.DeploymentConfigType:
 			found := false
 			iFound := -1
 			for i, dc := range depcon {
@@ -653,7 +809,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as DeploymentConfig", cname)
 				cnFound = false
 			}
-		case "StatefulSet":
+		case kubernetes.StatefulSetType:
 			found := false
 			iFound := -1
 			for i, fs := range fulset {
@@ -671,7 +827,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as StatefulSet", cname)
 				cnFound = false
 			}
-		case "Pod":
+		case kubernetes.PodType:
 			found := false
 			iFound := -1
 			for i, pod := range pods {
@@ -688,7 +844,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as Pod", cname)
 				cnFound = false
 			}
-		case "Job":
+		case kubernetes.JobType:
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
@@ -706,7 +862,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Errorf("Workload %s is not found as Job", cname)
 				cnFound = false
 			}
-		case "CronJob":
+		case kubernetes.CronJobType:
 			found := false
 			iFound := -1
 			for i, cjb := range conjbs {
@@ -724,21 +880,54 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				log.Warningf("Workload %s is not found as CronJob (CronJob could be deleted but children are still in the namespace)", cname)
 				cnFound = false
 			}
+		case kubernetes.DaemonSetType:
+			found := false
+			iFound := -1
+			for i, ds := range daeset {
+				if ds.Name == cname {
+					found = true
+					iFound = i
+					break
+				}
+			}
+			if found {
+				selector := labels.Set(daeset[iFound].Spec.Template.Labels).AsSelector()
+				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.ParseDaemonSet(&daeset[iFound])
+			} else {
+				log.Errorf("Workload %s is not found as Deployment", cname)
+				cnFound = false
+			}
 		default:
-			cPods := kubernetes.FilterPodsForController(cname, ctype, pods)
+			// ReplicaSet should be used to link Pods with a custom controller type i.e. Argo Rollout
+			childType := ctype
+			if _, unknownType := controllerOrder[ctype]; !unknownType {
+				childType = kubernetes.ReplicaSetType
+			}
+			cPods := kubernetes.FilterPodsForController(cname, childType, pods)
 			w.SetPods(cPods)
-			w.ParsePods(cname, ctype, cPods)
+			rsParsed := false
+			for _, rs := range repset {
+				if strings.HasPrefix(rs.Name, cname) {
+					w.ParseReplicaSetParent(&rs, cname, ctype)
+					rsParsed = true
+					break
+				}
+			}
+			if !rsParsed {
+				log.Warningf("Workload %s of type %s has not a ReplicaSet as a child controller, it may need a revisit", cname, ctype)
+				w.ParsePods(cname, ctype, cPods)
+			}
 		}
 
 		// Add the Proxy Status to the workload
 		for _, pod := range w.Pods {
 			if pod.HasIstioSidecar() {
 				ps, err := layer.ProxyStatus.GetPodProxyStatus(namespace, pod.Name)
-				if err != nil || ps == nil {
-					pod.ProxyStatus = &models.ProxyStatus{}
-					continue
+				if err != nil {
+					log.Warningf("GetPodProxyStatus is failing for [namespace: %s] [pod: %s]: %s ", namespace, pod.Name, err.Error())
 				}
-				pod.ProxyStatus = castProxyStatus(*ps)
+				pod.ProxyStatus = castProxyStatus(ps)
 			}
 		}
 
@@ -758,10 +947,13 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 	var fulset *apps_v1.StatefulSet
 	var jbs []batch_v1.Job
 	var conjbs []batch_v1beta1.CronJob
+	var ds *apps_v1.DaemonSet
 
 	wl := &models.Workload{
-		Pods:     models.Pods{},
-		Services: models.Services{},
+		Pods:              models.Pods{},
+		Services:          models.Services{},
+		Runtimes:          []models.Runtime{},
+		AdditionalDetails: []models.AdditionalItem{},
 	}
 
 	// Check if user has access to the namespace (RBAC) in cache scenarios and/or
@@ -770,9 +962,14 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 		return nil, err
 	}
 
+	// Flag used for custom controllers
+	// i.e. a third party framework creates its own "Deployment" controller with extra features
+	// on this case, Kiali will collect basic info from the ReplicaSet controller
+	_, knownWorkloadType := controllerOrder[workloadType]
+
 	wg := sync.WaitGroup{}
-	wg.Add(8)
-	errChan := make(chan error, 8)
+	wg.Add(9)
+	errChan := make(chan error, 9)
 
 	// Pods are always fetched for all workload types
 	go func() {
@@ -818,7 +1015,8 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 	go func() {
 		defer wg.Done()
 		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.ReplicaSetType {
+		// Unknown workload type will fetch ReplicaSet list
+		if workloadType != "" && workloadType != kubernetes.ReplicaSetType && knownWorkloadType {
 			return
 		}
 		var err error
@@ -917,6 +1115,21 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 		}
 	}()
 
+	go func() {
+		defer wg.Done()
+		// Check if workloadType is passed
+		if workloadType != "" && workloadType != kubernetes.DaemonSetType {
+			return
+		}
+		var err error
+		if isWorkloadIncluded(kubernetes.DaemonSetType) {
+			ds, err = layer.k8s.GetDaemonSet(namespace, workloadName)
+			if err != nil {
+				ds = nil
+			}
+		}
+	}()
+
 	wg.Wait()
 	if len(errChan) != 0 {
 		err := <-errChan
@@ -952,7 +1165,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 	// Resolve ReplicationControllers from DeploymentConfigs
 	// Resolve Jobs from CronJobs
 	for cname, ctype := range controllers {
-		if ctype == "ReplicaSet" {
+		if ctype == kubernetes.ReplicaSetType {
 			found := false
 			iFound := -1
 			for i, rs := range repset {
@@ -978,7 +1191,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				}
 			}
 		}
-		if ctype == "ReplicationController" {
+		if ctype == kubernetes.ReplicationControllerType {
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
@@ -1004,7 +1217,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				}
 			}
 		}
-		if ctype == "Job" {
+		if ctype == kubernetes.JobType {
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
@@ -1046,27 +1259,32 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 	// Cornercase, check for controllers without pods, to show them as a workload
 	if dep != nil {
 		if _, exist := controllers[dep.Name]; !exist {
-			controllers[dep.Name] = "Deployment"
+			controllers[dep.Name] = kubernetes.DeploymentType
 		}
 	}
 	for _, rs := range repset {
 		if _, exist := controllers[rs.Name]; !exist && len(rs.OwnerReferences) == 0 {
-			controllers[rs.Name] = "ReplicaSet"
+			controllers[rs.Name] = kubernetes.ReplicaSetType
 		}
 	}
 	if depcon != nil {
 		if _, exist := controllers[depcon.Name]; !exist {
-			controllers[depcon.Name] = "DeploymentConfig"
+			controllers[depcon.Name] = kubernetes.DeploymentConfigType
 		}
 	}
 	for _, rc := range repcon {
 		if _, exist := controllers[rc.Name]; !exist && len(rc.OwnerReferences) == 0 {
-			controllers[rc.Name] = "ReplicationController"
+			controllers[rc.Name] = kubernetes.ReplicationControllerType
 		}
 	}
 	if fulset != nil {
 		if _, exist := controllers[fulset.Name]; !exist {
-			controllers[fulset.Name] = "StatefulSet"
+			controllers[fulset.Name] = kubernetes.StatefulSetType
+		}
+	}
+	if ds != nil {
+		if _, exist := controllers[ds.Name]; !exist {
+			controllers[ds.Name] = kubernetes.DaemonSetType
 		}
 	}
 
@@ -1074,15 +1292,23 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 
 	if _, exist := controllers[workloadName]; exist {
 		w := models.Workload{
-			Pods:     models.Pods{},
-			Services: models.Services{},
+			Pods:              models.Pods{},
+			Services:          models.Services{},
+			Runtimes:          []models.Runtime{},
+			AdditionalDetails: []models.AdditionalItem{},
 		}
 		ctype := controllers[workloadName]
+		// Cornercase -> a controller is found but API is forcing a different workload type
+		// https://github.com/kiali/kiali/issues/3830
+		controllerType := ctype
+		if workloadType != "" && ctype != workloadType {
+			controllerType = workloadType
+		}
 		// Flag to add a controller if it is found
 		cnFound := true
-		switch ctype {
-		case "Deployment":
-			if dep.Name == workloadName {
+		switch controllerType {
+		case kubernetes.DeploymentType:
+			if dep != nil && dep.Name == workloadName {
 				selector := labels.Set(dep.Spec.Template.Labels).AsSelector()
 				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
 				w.ParseDeployment(dep)
@@ -1090,7 +1316,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as Deployment", workloadName)
 				cnFound = false
 			}
-		case "ReplicaSet":
+		case kubernetes.ReplicaSetType:
 			found := false
 			iFound := -1
 			for i, rs := range repset {
@@ -1108,7 +1334,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as ReplicaSet", workloadName)
 				cnFound = false
 			}
-		case "ReplicationController":
+		case kubernetes.ReplicationControllerType:
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
@@ -1126,8 +1352,8 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as ReplicationController", workloadName)
 				cnFound = false
 			}
-		case "DeploymentConfig":
-			if depcon.Name == workloadName {
+		case kubernetes.DeploymentConfigType:
+			if depcon != nil && depcon.Name == workloadName {
 				selector := labels.Set(depcon.Spec.Template.Labels).AsSelector()
 				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
 				w.ParseDeploymentConfig(depcon)
@@ -1135,8 +1361,8 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as DeploymentConfig", workloadName)
 				cnFound = false
 			}
-		case "StatefulSet":
-			if fulset.Name == workloadName {
+		case kubernetes.StatefulSetType:
+			if fulset != nil && fulset.Name == workloadName {
 				selector := labels.Set(fulset.Spec.Template.Labels).AsSelector()
 				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
 				w.ParseStatefulSet(fulset)
@@ -1144,7 +1370,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as StatefulSet", workloadName)
 				cnFound = false
 			}
-		case "Pod":
+		case kubernetes.PodType:
 			found := false
 			iFound := -1
 			for i, pod := range pods {
@@ -1161,7 +1387,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as Pod", workloadName)
 				cnFound = false
 			}
-		case "Job":
+		case kubernetes.JobType:
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
@@ -1179,7 +1405,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Errorf("Workload %s is not found as Job", workloadName)
 				cnFound = false
 			}
-		case "CronJob":
+		case kubernetes.CronJobType:
 			found := false
 			iFound := -1
 			for i, cjb := range conjbs {
@@ -1197,24 +1423,47 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				log.Warningf("Workload %s is not found as CronJob (CronJob could be deleted but children are still in the namespace)", workloadName)
 				cnFound = false
 			}
+		case kubernetes.DaemonSetType:
+			if ds != nil && ds.Name == workloadName {
+				selector := labels.Set(ds.Spec.Template.Labels).AsSelector()
+				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.ParseDaemonSet(ds)
+			} else {
+				log.Errorf("Workload %s is not found as DaemonSet", workloadName)
+				cnFound = false
+			}
 		default:
-			cPods := kubernetes.FilterPodsForController(workloadName, ctype, pods)
+			// ReplicaSet should be used to link Pods with a custom controller type i.e. Argo Rollout
+			// Note, we will use the controller found in the Pod resolution, instead that the passed by parameter
+			// This will cover cornercase for https://github.com/kiali/kiali/issues/3830
+			childType := ctype
+			if _, unknownType := controllerOrder[ctype]; !unknownType {
+				childType = kubernetes.ReplicaSetType
+			}
+			cPods := kubernetes.FilterPodsForController(workloadName, childType, pods)
 			w.SetPods(cPods)
-			w.ParsePods(workloadName, ctype, cPods)
+			rsParsed := false
+			for _, rs := range repset {
+				if strings.HasPrefix(rs.Name, workloadName) {
+					w.ParseReplicaSetParent(&rs, workloadName, ctype)
+					rsParsed = true
+					break
+				}
+			}
+			if !rsParsed {
+				log.Warningf("Workload %s of type %s has not a ReplicaSet as a child controller, it may need a revisit", workloadName, ctype)
+				w.ParsePods(workloadName, ctype, cPods)
+			}
 		}
 
 		// Add the Proxy Status to the workload
 		for _, pod := range w.Pods {
 			if pod.HasIstioSidecar() {
 				ps, err := layer.ProxyStatus.GetPodProxyStatus(namespace, pod.Name)
-				if err != nil || ps == nil {
-					if err != nil {
-						log.Warningf("GetPodProxyStatus is failing for [namespace: %s] [pod: %s]: %s ", namespace, pod.Name, err.Error())
-					}
-					pod.ProxyStatus = nil
-					continue
+				if err != nil {
+					log.Warningf("GetPodProxyStatus is failing for [namespace: %s] [pod: %s]: %s ", namespace, pod.Name, err.Error())
 				}
-				pod.ProxyStatus = castProxyStatus(*ps)
+				pod.ProxyStatus = castProxyStatus(ps)
 			}
 		}
 
@@ -1241,6 +1490,7 @@ func updateWorkload(layer *Layer, namespace string, workloadName string, workloa
 		kubernetes.JobType,
 		kubernetes.CronJobType,
 		kubernetes.PodType,
+		kubernetes.DaemonSetType,
 	}
 
 	// workloadType is an optional parameter used to optimize the workload type fetch

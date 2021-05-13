@@ -29,7 +29,9 @@ func TestWorkloadSidecarsPasses(t *testing.T) {
 	globalInfo.Business = businessLayer
 	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
 
-	a := SidecarsCheckAppender{}
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
 	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
 
 	for _, node := range trafficMap {
@@ -47,13 +49,35 @@ func TestWorkloadWithMissingSidecarsIsFlagged(t *testing.T) {
 	globalInfo.Business = businessLayer
 	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
 
-	a := SidecarsCheckAppender{}
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
 	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
 
 	for _, node := range trafficMap {
 		flag, ok := node.Metadata[graph.HasMissingSC].(bool)
 		assert.True(t, ok)
 		assert.True(t, flag)
+	}
+}
+
+func TestInaccessibleWorkload(t *testing.T) {
+	config.Set(config.NewConfig())
+	trafficMap := buildInaccessibleWorkloadTrafficMap()
+	businessLayer := setupSidecarsCheckWorkloads(buildFakeWorkloadDeployments(), buildFakeWorkloadPodsNoSidecar())
+
+	globalInfo := graph.NewAppenderGlobalInfo()
+	globalInfo.Business = businessLayer
+	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
+
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
+	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
+
+	for _, node := range trafficMap {
+		_, ok := node.Metadata[graph.HasMissingSC].(bool)
+		assert.False(t, ok)
 	}
 }
 
@@ -66,7 +90,9 @@ func TestAppNoPodsPasses(t *testing.T) {
 	globalInfo.Business = businessLayer
 	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
 
-	a := SidecarsCheckAppender{}
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
 	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
 
 	for _, node := range trafficMap {
@@ -84,7 +110,9 @@ func TestAppSidecarsPasses(t *testing.T) {
 	globalInfo.Business = businessLayer
 	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
 
-	a := SidecarsCheckAppender{}
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
 	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
 
 	for _, node := range trafficMap {
@@ -102,7 +130,9 @@ func TestAppWithMissingSidecarsIsFlagged(t *testing.T) {
 	globalInfo.Business = businessLayer
 	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
 
-	a := SidecarsCheckAppender{}
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
 	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
 
 	for _, node := range trafficMap {
@@ -120,7 +150,9 @@ func TestServicesAreAlwaysValid(t *testing.T) {
 	globalInfo.Business = businessLayer
 	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
 
-	a := SidecarsCheckAppender{}
+	a := SidecarsCheckAppender{
+		AccessibleNamespaces: map[string]time.Time{"testNamespace": time.Now()},
+	}
 	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
 
 	for _, node := range trafficMap {
@@ -132,7 +164,16 @@ func TestServicesAreAlwaysValid(t *testing.T) {
 func buildWorkloadTrafficMap() graph.TrafficMap {
 	trafficMap := graph.NewTrafficMap()
 
-	node := graph.NewNode("testNamespace", "", "testNamespace", "workload-1", graph.Unknown, graph.Unknown, graph.GraphTypeWorkload)
+	node := graph.NewNode(graph.Unknown, "testNamespace", "", "testNamespace", "workload-1", graph.Unknown, graph.Unknown, graph.GraphTypeWorkload)
+	trafficMap[node.ID] = &node
+
+	return trafficMap
+}
+
+func buildInaccessibleWorkloadTrafficMap() graph.TrafficMap {
+	trafficMap := graph.NewTrafficMap()
+
+	node := graph.NewNode(graph.Unknown, "inaccessibleNamespace", "", "inaccessibleNamespace", "workload-1", graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
 	trafficMap[node.ID] = &node
 
 	return trafficMap
@@ -141,7 +182,7 @@ func buildWorkloadTrafficMap() graph.TrafficMap {
 func buildAppTrafficMap() graph.TrafficMap {
 	trafficMap := graph.NewTrafficMap()
 
-	node := graph.NewNode("testNamespace", "", "testNamespace", graph.Unknown, "myTest", graph.Unknown, graph.GraphTypeVersionedApp)
+	node := graph.NewNode(graph.Unknown, "testNamespace", "", "testNamespace", graph.Unknown, "myTest", graph.Unknown, graph.GraphTypeVersionedApp)
 	trafficMap[node.ID] = &node
 
 	return trafficMap
@@ -150,7 +191,7 @@ func buildAppTrafficMap() graph.TrafficMap {
 func buildServiceTrafficMap() graph.TrafficMap {
 	trafficMap := graph.NewTrafficMap()
 
-	node := graph.NewNode("testNamespace", "svc", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
+	node := graph.NewNode(graph.Unknown, "testNamespace", "svc", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
 	trafficMap[node.ID] = &node
 
 	return trafficMap
@@ -211,6 +252,7 @@ func setupSidecarsCheckWorkloads(deployments []apps_v1.Deployment, pods []core_v
 	k8s.On("GetReplicationControllers", mock.AnythingOfType("string")).Return([]core_v1.ReplicationController{}, nil)
 	k8s.On("GetReplicaSets", mock.AnythingOfType("string")).Return([]apps_v1.ReplicaSet{}, nil)
 	k8s.On("GetStatefulSets", mock.AnythingOfType("string")).Return([]apps_v1.StatefulSet{}, nil)
+	k8s.On("GetDaemonSets", mock.AnythingOfType("string")).Return([]apps_v1.DaemonSet{}, nil)
 	config.Set(config.NewConfig())
 
 	businessLayer := business.NewWithBackends(k8s, nil, nil)

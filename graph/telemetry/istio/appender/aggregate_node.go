@@ -58,11 +58,11 @@ func (a AggregateNodeAppender) appendGraph(trafficMap graph.TrafficMap, namespac
 
 	// query prometheus for aggregate info in two queries (assume aggregation is typically request classification, so use dest telemetry):
 	//   note1: we want to only match the aggregate when it is set and not "unknown".  But in Prometheus a negative test on an unset label
-	//      matches everything, so using %s!=unknown mneans we still have to filter out unset time-series below...
+	//      matches everything, so using %s!=unknown means we still have to filter out unset time-series below...
 	//   note2: for now we will filter out aggregates with no traffic on the assumption that users probably don't want to
 	//      see them and it will just increase the graph density.  To change that behavior remove the "> 0" conditions.
 	// 1) query for requests originating from a workload outside the namespace.
-	groupBy := fmt.Sprintf("source_workload_namespace,source_workload,source_%s,source_%s,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_%s,destination_%s,request_protocol,response_code,grpc_response_status,response_flags,%s", appLabel, verLabel, appLabel, verLabel, a.Aggregate)
+	groupBy := fmt.Sprintf("source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,%s", a.Aggregate)
 	httpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",source_workload_namespace!="%s",destination_service_namespace="%v",%s!="unknown"}[%vs])) by (%s) > 0`,
 		"istio_requests_total",
 		namespace,
@@ -82,7 +82,7 @@ func (a AggregateNodeAppender) appendGraph(trafficMap graph.TrafficMap, namespac
 	query := fmt.Sprintf(`(%s) OR (%s)`, httpQuery, tcpQuery)
 	*/
 	query := httpQuery
-	vector := promQuery(query, time.Unix(a.QueryTime, 0), client.API(), a)
+	vector := promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
 	a.injectAggregates(trafficMap, &vector)
 
 	// 2) query for requests originating from a workload inside of the namespace
@@ -102,7 +102,7 @@ func (a AggregateNodeAppender) appendGraph(trafficMap graph.TrafficMap, namespac
 	query = fmt.Sprintf(`(%s) OR (%s)`, httpQuery, tcpQuery)
 	*/
 	query = httpQuery
-	vector = promQuery(query, time.Unix(a.QueryTime, 0), client.API(), a)
+	vector = promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
 	a.injectAggregates(trafficMap, &vector)
 }
 
@@ -117,7 +117,7 @@ func (a AggregateNodeAppender) appendNodeGraph(trafficMap graph.TrafficMap, name
 	if a.Service != "" {
 		serviceFragment = fmt.Sprintf(`,destination_service_name="%s"`, a.Service)
 	}
-	groupBy := fmt.Sprintf("source_workload_namespace,source_workload,source_%s,source_%s,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_%s,destination_%s,request_protocol,response_code,grpc_response_status,response_flags,%s", appLabel, verLabel, appLabel, verLabel, a.Aggregate)
+	groupBy := fmt.Sprintf("source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,%s", a.Aggregate)
 	httpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s",%s="%s"%s}[%vs])) by (%s) > 0`,
 		"istio_requests_total",
 		namespace,
@@ -138,24 +138,26 @@ func (a AggregateNodeAppender) appendNodeGraph(trafficMap graph.TrafficMap, name
 	query := fmt.Sprintf(`(%s) OR (%s)`, httpQuery, tcpQuery)
 	*/
 	query := httpQuery
-	vector := promQuery(query, time.Unix(a.QueryTime, 0), client.API(), a)
+	vector := promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
 	a.injectAggregates(trafficMap, &vector)
 }
 
 func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vector *model.Vector) {
 	for _, s := range *vector {
 		m := s.Metric
+		lSourceCluster, sourceClusterOk := m["source_cluster"]
 		lSourceWlNs, sourceWlNsOk := m["source_workload_namespace"]
 		lSourceWl, sourceWlOk := m["source_workload"]
-		lSourceApp, sourceAppOk := m[model.LabelName("source_"+appLabel)]
-		lSourceVer, sourceVerOk := m[model.LabelName("source_"+verLabel)]
+		lSourceApp, sourceAppOk := m["source_canonical_service"]
+		lSourceVer, sourceVerOk := m["source_canonical_revision"]
+		lDestCluster, destClusterOk := m["destination_cluster"]
 		lDestSvcNs, destSvcNsOk := m["destination_service_namespace"]
 		lDestSvc, destSvcOk := m["destination_service"]
 		lDestSvcName, destSvcNameOk := m["destination_service_name"]
 		lDestWlNs, destWlNsOk := m["destination_workload_namespace"]
 		lDestWl, destWlOk := m["destination_workload"]
-		lDestApp, destAppOk := m[model.LabelName("destination_"+appLabel)]
-		lDestVer, destVerOk := m[model.LabelName("destination_"+verLabel)]
+		lDestApp, destAppOk := m["destination_canonical_service"]
+		lDestVer, destVerOk := m["destination_canonical_revision"]
 		lCode := m["response_code"]                // will be missing for TCP
 		lGrpc, grpcOk := m["grpc_response_status"] // will be missing for non-GRPC
 		lFlags, flagsOk := m["response_flags"]
@@ -181,7 +183,10 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 		flags := string(lFlags)
 		aggregate := string(lAggregate)
 
-		if util.IsBadSourceTelemetry(sourceWlNs, sourceWl, sourceApp) {
+		// handle clusters
+		sourceCluster, destCluster := util.HandleClusters(lSourceCluster, sourceClusterOk, lDestCluster, destClusterOk)
+
+		if util.IsBadSourceTelemetry(sourceCluster, sourceClusterOk, sourceWlNs, sourceWl, sourceApp) {
 			continue
 		}
 
@@ -196,9 +201,9 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 		}
 
 		// handle unusual destinations
-		destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, _ := util.HandleDestination(sourceWlNs, sourceWl, string(lDestSvcNs), string(lDestSvc), string(lDestSvcName), string(lDestWlNs), string(lDestWl), string(lDestApp), string(lDestVer))
+		destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, _ := util.HandleDestination(sourceCluster, sourceWlNs, sourceWl, destCluster, string(lDestSvcNs), string(lDestSvc), string(lDestSvcName), string(lDestWlNs), string(lDestWl), string(lDestApp), string(lDestVer))
 
-		if util.IsBadDestTelemetry(destSvc, destSvcName, destWl) {
+		if util.IsBadDestTelemetry(destCluster, destClusterOk, destSvcNs, destSvc, destSvcName, destWl) {
 			continue
 		}
 
@@ -208,7 +213,7 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 		val := float64(s.Value)
 
 		// inject aggregate node between source and destination
-		sourceID, _ := graph.Id(sourceWlNs, "", sourceWlNs, sourceWl, sourceApp, sourceVer, a.GraphType)
+		sourceID, _ := graph.Id(sourceCluster, sourceWlNs, "", sourceWlNs, sourceWl, sourceApp, sourceVer, a.GraphType)
 		sourceNode, sourceFound := trafficMap[sourceID]
 		if !sourceFound {
 			log.Debugf("Expected source [%s] node not found in traffic map. Skipping aggregate injection [%s]", sourceID, aggregate)
@@ -221,9 +226,9 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 		// else show the independent aggregation by using the workload/app node as the dest
 		destID := ""
 		if a.InjectServiceNodes {
-			destID, _ = graph.Id(destSvcNs, destSvcName, "", "", "", "", a.GraphType) // service
+			destID, _ = graph.Id(destCluster, destSvcNs, destSvcName, "", "", "", "", a.GraphType) // service
 		} else {
-			destID, _ = graph.Id(destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType) // wl/app
+			destID, _ = graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType) // wl/app
 		}
 		destNode, destFound := trafficMap[destID]
 		if !destFound {
@@ -233,9 +238,9 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 
 		var aggrNode *graph.Node
 		if a.InjectServiceNodes {
-			aggrNode, _ = addNode(trafficMap, destSvcNs, a.Aggregate, aggregate, destSvcName, destApp)
+			aggrNode, _ = addNode(trafficMap, destCluster, destSvcNs, a.Aggregate, aggregate, destSvcName, destApp)
 		} else {
-			aggrNode, _ = addNode(trafficMap, destWlNs, a.Aggregate, aggregate, "", "")
+			aggrNode, _ = addNode(trafficMap, destCluster, destWlNs, a.Aggregate, aggregate, "", "")
 		}
 
 		// replace the non-classified edge (from source to dest) with the classified edges
@@ -279,11 +284,11 @@ func addTraffic(val float64, protocol, code, flags, host string, source, dest *g
 	graph.AddToMetadata(protocol, val, code, flags, host, sourceMetadata, destMetadata, edge.Metadata)
 }
 
-func addNode(trafficMap graph.TrafficMap, namespace, aggregate, aggregateVal, svcName, app string) (*graph.Node, bool) {
-	id := graph.AggregateID(namespace, aggregate, aggregateVal, svcName)
+func addNode(trafficMap graph.TrafficMap, cluster, namespace, aggregate, aggregateVal, svcName, app string) (*graph.Node, bool) {
+	id := graph.AggregateID(cluster, namespace, aggregate, aggregateVal, svcName)
 	node, found := trafficMap[id]
 	if !found {
-		newNode := graph.NewAggregateNodeExplicit(id, namespace, aggregate, aggregateVal, svcName, app)
+		newNode := graph.NewAggregateNodeExplicit(id, cluster, namespace, aggregate, aggregateVal, svcName, app)
 		node = &newNode
 		trafficMap[id] = node
 	}

@@ -7,6 +7,7 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/kiali/kiali/graph"
+	"github.com/kiali/kiali/graph/telemetry/istio/util"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/prometheus"
 )
@@ -54,7 +55,7 @@ func (a SecurityPolicyAppender) appendGraph(trafficMap graph.TrafficMap, namespa
 
 	// query prometheus for mutual_tls info in two queries (use dest telemetry because it reports the security policy):
 	// 1) query for requests originating from a workload outside the namespace.
-	groupBy := fmt.Sprintf("source_workload_namespace,source_workload,source_%s,source_%s,source_principal,destination_service_namespace,destination_service_name,destination_workload_namespace,destination_workload,destination_%s,destination_%s,destination_principal,connection_security_policy", appLabel, verLabel, appLabel, verLabel)
+	groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,source_principal,destination_cluster,destination_service_namespace,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,destination_principal,connection_security_policy"
 	httpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",source_workload_namespace!="%v",destination_service_namespace="%v"}[%vs])) by (%s) > 0`,
 		"istio_requests_total",
 		namespace,
@@ -68,7 +69,7 @@ func (a SecurityPolicyAppender) appendGraph(trafficMap graph.TrafficMap, namespa
 		int(duration.Seconds()), // range duration for the query
 		groupBy)
 	query := fmt.Sprintf(`(%s) OR (%s)`, httpQuery, tcpQuery)
-	outVector := promQuery(query, time.Unix(a.QueryTime, 0), client.API(), a)
+	outVector := promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
 
 	// 2) query for requests originating from a workload inside of the namespace
 	httpQuery = fmt.Sprintf(`sum(rate(%s{reporter="destination",source_workload_namespace="%v"}[%vs])) by (%s) > 0`,
@@ -82,7 +83,7 @@ func (a SecurityPolicyAppender) appendGraph(trafficMap graph.TrafficMap, namespa
 		int(duration.Seconds()), // range duration for the query
 		groupBy)
 	query = fmt.Sprintf(`(%s) OR (%s)`, httpQuery, tcpQuery)
-	inVector := promQuery(query, time.Unix(a.QueryTime, 0), client.API(), a)
+	inVector := promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
 
 	// create map to quickly look up securityPolicy
 	securityPolicyMap := make(map[string]PolicyRates)
@@ -96,17 +97,19 @@ func (a SecurityPolicyAppender) appendGraph(trafficMap graph.TrafficMap, namespa
 func (a SecurityPolicyAppender) populateSecurityPolicyMap(securityPolicyMap map[string]PolicyRates, principalMap map[string]map[graph.MetadataKey]string, vector *model.Vector) {
 	for _, s := range *vector {
 		m := s.Metric
+		lSourceCluster, sourceClusterOk := m["source_cluster"]
 		lSourceWlNs, sourceWlNsOk := m["source_workload_namespace"]
 		lSourceWl, sourceWlOk := m["source_workload"]
-		lSourceApp, sourceAppOk := m[model.LabelName("source_"+appLabel)]
-		lSourceVer, sourceVerOk := m[model.LabelName("source_"+verLabel)]
+		lSourceApp, sourceAppOk := m["source_canonical_service"]
+		lSourceVer, sourceVerOk := m["source_canonical_revision"]
 		lSourcePrincipal, sourcePrincipalOk := m["source_principal"]
+		lDestCluster, destClusterOk := m["destination_cluster"]
 		lDestSvcNs, destSvcNsOk := m["destination_service_namespace"]
 		lDestSvcName, destSvcNameOk := m["destination_service_name"]
 		lDestWlNs, destWlNsOk := m["destination_workload_namespace"]
 		lDestWl, destWlOk := m["destination_workload"]
-		lDestApp, destAppOk := m[model.LabelName("destination_"+appLabel)]
-		lDestVer, destVerOk := m[model.LabelName("destination_"+verLabel)]
+		lDestApp, destAppOk := m["destination_canonical_service"]
+		lDestVer, destVerOk := m["destination_canonical_revision"]
 		lDestPrincipal, destPrincipalOk := m["destination_principal"]
 		lCsp, cspOk := m["connection_security_policy"]
 
@@ -131,27 +134,30 @@ func (a SecurityPolicyAppender) populateSecurityPolicyMap(securityPolicyMap map[
 
 		val := float64(s.Value)
 
+		// handle clusters
+		sourceCluster, destCluster := util.HandleClusters(lSourceCluster, sourceClusterOk, lDestCluster, destClusterOk)
+
 		// don't inject a service node if destSvcName is not set or the dest node is already a service node.
 		inject := false
 		if a.InjectServiceNodes && graph.IsOK(destSvcName) {
-			_, destNodeType := graph.Id(destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType)
+			_, destNodeType := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType)
 			inject = (graph.NodeTypeService != destNodeType)
 		}
 		if inject {
-			a.addSecurityPolicy(securityPolicyMap, csp, val, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destSvcNs, destSvcName, "", "", "", "")
-			a.addSecurityPolicy(securityPolicyMap, csp, val, destSvcNs, destSvcName, "", "", "", destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
-			a.addPrincipal(principalMap, sourceWlNs, "", sourceWl, sourceApp, sourceVer, sourcePrincipal, destSvcNs, destSvcName, "", "", "", "", destPrincipal)
-			a.addPrincipal(principalMap, destSvcNs, destSvcName, "", "", "", sourcePrincipal, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, destPrincipal)
+			a.addSecurityPolicy(securityPolicyMap, csp, val, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, "", "", "", "")
+			a.addSecurityPolicy(securityPolicyMap, csp, val, destCluster, destSvcNs, destSvcName, "", "", "", destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
+			a.addPrincipal(principalMap, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, sourcePrincipal, destCluster, destSvcNs, destSvcName, "", "", "", "", destPrincipal)
+			a.addPrincipal(principalMap, destCluster, destSvcNs, destSvcName, "", "", "", sourcePrincipal, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, destPrincipal)
 		} else {
-			a.addSecurityPolicy(securityPolicyMap, csp, val, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
-			a.addPrincipal(principalMap, sourceWlNs, "", sourceWl, sourceApp, sourceVer, sourcePrincipal, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, destPrincipal)
+			a.addSecurityPolicy(securityPolicyMap, csp, val, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
+			a.addPrincipal(principalMap, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, sourcePrincipal, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, destPrincipal)
 		}
 	}
 }
 
-func (a SecurityPolicyAppender) addSecurityPolicy(securityPolicyMap map[string]PolicyRates, csp string, val float64, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer string) {
-	sourceId, _ := graph.Id(sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
-	destId, _ := graph.Id(destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
+func (a SecurityPolicyAppender) addSecurityPolicy(securityPolicyMap map[string]PolicyRates, csp string, val float64, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer string) {
+	sourceId, _ := graph.Id(sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
+	destId, _ := graph.Id(destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
 	key := fmt.Sprintf("%s %s", sourceId, destId)
 	var policyRates PolicyRates
 	var ok bool
@@ -188,10 +194,10 @@ func applySecurityPolicy(trafficMap graph.TrafficMap, securityPolicyMap map[stri
 	}
 }
 
-func (a SecurityPolicyAppender) addPrincipal(principalMap map[string]map[graph.MetadataKey]string, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, sourcePrincipal, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, destPrincipal string) {
-	sourceId, _ := graph.Id(sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
-	destId, _ := graph.Id(destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
-	key := fmt.Sprintf("%s %s", sourceId, destId)
+func (a SecurityPolicyAppender) addPrincipal(principalMap map[string]map[graph.MetadataKey]string, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, sourcePrincipal, destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, destPrincipal string) {
+	sourceID, _ := graph.Id(sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
+	destID, _ := graph.Id(destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
+	key := fmt.Sprintf("%s %s", sourceID, destID)
 	var ok bool
 	if _, ok = principalMap[key]; !ok {
 		kPrincipalMap := make(map[graph.MetadataKey]string)

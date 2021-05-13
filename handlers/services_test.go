@@ -16,6 +16,7 @@ import (
 	prom_v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
@@ -29,7 +30,13 @@ func TestServiceMetricsDefault(t *testing.T) {
 	ts, api, _ := setupServiceMetricsEndpoint(t)
 	defer ts.Close()
 
-	url := ts.URL + "/api/namespaces/ns/services/svc/metrics"
+	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := req.URL.Query()
+	q.Add("direction", "inbound")
+	req.URL.RawQuery = q.Encode()
 	now := time.Now()
 	delta := 15 * time.Second
 	var gaugeSentinel uint32
@@ -48,7 +55,8 @@ func TestServiceMetricsDefault(t *testing.T) {
 		assert.WithinDuration(t, now.Add(-30*time.Minute), r.Start, delta)
 	})
 
-	resp, err := http.Get(url)
+	httpclient := &http.Client{}
+	resp, err := httpclient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +77,7 @@ func TestServiceMetricsWithParams(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := req.URL.Query()
+	q.Add("direction", "inbound")
 	q.Add("rateInterval", "5h")
 	q.Add("rateFunc", "rate")
 	q.Add("step", "2")
@@ -327,18 +336,18 @@ func setupServiceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustes
 	config.Set(conf)
 	k8s := kubetest.NewK8SClientMock()
 
-	api := new(prometheustest.PromAPIMock)
+	xapi := new(prometheustest.PromAPIMock)
 	prom, err := prometheus.NewClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	prom.Inject(api)
+	prom.Inject(xapi)
 	k8s.On("GetProject", "ns").Return(&osproject_v1.Project{}, nil)
 
 	mr := mux.NewRouter()
 	mr.HandleFunc("/api/namespaces/{namespace}/services/{service}/metrics", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "token", "test")
+			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
 			getServiceMetrics(w, r.WithContext(context), func() (*prometheus.Client, error) {
 				return prom, nil
 			})
@@ -349,5 +358,5 @@ func setupServiceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustes
 	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
 	business.SetWithBackends(mockClientFactory, prom)
 
-	return ts, api, k8s
+	return ts, xapi, k8s
 }

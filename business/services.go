@@ -1,6 +1,7 @@
 package business
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -122,6 +123,7 @@ func (in *SvcService) buildServiceList(namespace models.Namespace, svcs []core_v
 			IstioSidecar:           hasSidecar,
 			AppLabel:               appLabel,
 			AdditionalDetailSample: models.GetFirstAdditionalIcon(conf, item.ObjectMeta.Annotations),
+			HealthAnnotations:      models.GetHealthAnnotation(item.Annotations, models.GetHealthConfigAnnotation()),
 			Labels:                 item.Labels,
 		}
 	}
@@ -156,8 +158,8 @@ func (in *SvcService) GetService(namespace, service, interval string, queryTime 
 	additionalDetails := models.GetAdditionalDetails(conf, svc.ObjectMeta.Annotations)
 
 	wg := sync.WaitGroup{}
-	wg.Add(6)
-	errChan := make(chan error, 6)
+	wg.Add(5)
+	errChan := make(chan error, 5)
 
 	labelsSelector := labels.Set(svc.Spec.Selector).String()
 	// If service doesn't have any selector, we can't know which are the pods and workloads applying.
@@ -241,15 +243,19 @@ func (in *SvcService) GetService(namespace, service, interval string, queryTime 
 	}()
 
 	var vsCreate, vsUpdate, vsDelete bool
-	go func() {
-		defer wg.Done()
-		vsCreate, vsUpdate, vsDelete = getPermissions(in.k8s, namespace, kubernetes.VirtualServices)
-	}()
-
 	var drCreate, drUpdate, drDelete bool
 	go func() {
 		defer wg.Done()
-		drCreate, drUpdate, drDelete = getPermissions(in.k8s, namespace, kubernetes.DestinationRules)
+		/*
+			We can safely assume that permissions for VirtualServices will be similar as DestinationRules.
+
+			Synced with:
+			https://github.com/kiali/kiali-operator/blob/master/roles/default/kiali-deploy/templates/kubernetes/role.yaml#L62
+		*/
+		vsCreate, vsUpdate, vsDelete = getPermissions(in.k8s, namespace, kubernetes.VirtualServices)
+		drCreate = vsCreate
+		drUpdate = vsUpdate
+		drDelete = vsDelete
 	}()
 
 	wg.Wait()
@@ -274,6 +280,26 @@ func (in *SvcService) GetService(namespace, service, interval string, queryTime 
 	return &s, nil
 }
 
+func (in *SvcService) UpdateService(namespace, service string, interval string, queryTime time.Time, jsonPatch string) (*models.ServiceDetails, error) {
+	var err error
+	promtimer := internalmetrics.GetGoFunctionMetric("business", "SvcService", "GetService")
+	defer promtimer.ObserveNow(&err)
+
+	// Identify controller and apply patch to workload
+	err = updateService(in.businessLayer, namespace, service, jsonPatch)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache is stopped after a Create/Update/Delete operation to force a refresh
+	if kialiCache != nil && err == nil {
+		kialiCache.RefreshNamespace(namespace)
+	}
+
+	// After the update we fetch the whole workload
+	return in.GetService(namespace, service, interval, queryTime)
+}
+
 // GetServiceDefinition returns a single service definition (the service object and endpoints), no istio or runtime information
 func (in *SvcService) GetServiceDefinition(namespace, service string) (*models.ServiceDetails, error) {
 	var err error
@@ -291,6 +317,18 @@ func (in *SvcService) GetServiceDefinition(namespace, service string) (*models.S
 	return &s, nil
 }
 
+func (in *SvcService) getService(namespace, service string) (svc *core_v1.Service, err error) {
+	if IsNamespaceCached(namespace) {
+		// Cache uses Kiali ServiceAccount, check if user can access to the namespace
+		if _, err = in.businessLayer.Namespace.GetNamespace(namespace); err == nil {
+			svc, err = kialiCache.GetService(namespace, service)
+		}
+	} else {
+		svc, err = in.k8s.GetService(namespace, service)
+	}
+	return svc, err
+}
+
 func (in *SvcService) getServiceDefinition(namespace, service string) (svc *core_v1.Service, eps *core_v1.Endpoints, err error) {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -299,7 +337,7 @@ func (in *SvcService) getServiceDefinition(namespace, service string) (svc *core
 	go func() {
 		defer wg.Done()
 		var err2 error
-		svc, err2 = in.k8s.GetService(namespace, service)
+		svc, err2 = in.getService(namespace, service)
 		if err2 != nil {
 			log.Errorf("Error fetching definition for service [%s:%s]: %s", namespace, service, err2)
 			errChan <- err2
@@ -309,7 +347,14 @@ func (in *SvcService) getServiceDefinition(namespace, service string) (svc *core
 	go func() {
 		defer wg.Done()
 		var err2 error
-		eps, err2 = in.k8s.GetEndpoints(namespace, service)
+		if IsNamespaceCached(namespace) {
+			// Cache uses Kiali ServiceAccount, check if user can access to the namespace
+			if _, err = in.businessLayer.Namespace.GetNamespace(namespace); err == nil {
+				eps, err = kialiCache.GetEndpoints(namespace, service)
+			}
+		} else {
+			eps, err2 = in.k8s.GetEndpoints(namespace, service)
+		}
 		if err2 != nil && !errors.IsNotFound(err2) {
 			log.Errorf("Error fetching Endpoints  namespace %s and service %s: %s", namespace, service, err2)
 			errChan <- err2
@@ -320,6 +365,9 @@ func (in *SvcService) getServiceDefinition(namespace, service string) (svc *core
 	if len(errChan) != 0 {
 		err = <-errChan
 		return nil, nil, err
+	}
+	if svc == nil {
+		return nil, nil, kubernetes.NewNotFound(service, "Kiali", "Service")
 	}
 
 	return svc, eps, nil
@@ -380,12 +428,22 @@ func (in *SvcService) GetServiceAppName(namespace, service string) (string, erro
 		return "", err
 	}
 
-	svc, err := in.k8s.GetService(namespace, service)
-	if err != nil {
-		return "", err
+	svc, err := in.getService(namespace, service)
+	if svc == nil || err != nil {
+		return "", fmt.Errorf("Service [namespace: %s] [name: %s] doesn't exist.", namespace, service)
 	}
 
 	appLabelName := config.Get().IstioLabels.AppLabelName
 	app := svc.Spec.Selector[appLabelName]
 	return app, nil
+}
+
+func updateService(layer *Layer, namespace string, service string, jsonPatch string) error {
+	// Check if user has access to the namespace (RBAC) in cache scenarios and/or
+	// if namespace is accessible from Kiali (Deployment.AccessibleNamespaces)
+	if _, err := layer.Namespace.GetNamespace(namespace); err != nil {
+		return err
+	}
+
+	return layer.k8s.UpdateService(namespace, service, jsonPatch)
 }

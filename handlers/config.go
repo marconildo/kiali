@@ -7,31 +7,30 @@ import (
 
 	"github.com/prometheus/common/model"
 	"gopkg.in/yaml.v2"
+	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/prometheus"
-	"github.com/kiali/kiali/status"
 )
 
 const (
 	defaultPrometheusGlobalScrapeInterval = 15 // seconds
 )
 
-type ThreeScaleConfig struct {
-	AdapterName    string `json:"adapterName"`
-	AdapterPort    string `json:"adapterPort"`
-	AdapterService string `json:"adapterService"`
-	Enabled        bool   `json:"enabled"`
-	TemplateName   string `json:"templateName"`
+type ClusterInfo struct {
+	Name    string `json:"name,omitempty"`
+	Network string `json:"network,omitempty"`
 }
+
 type Iter8Config struct {
 	Enabled   bool   `json:"enabled"`
 	Namespace string `json:"namespace"`
 }
 type Extensions struct {
-	ThreeScale ThreeScaleConfig `json:"threescale,omitempty"`
-	Iter8      Iter8Config      `json:"iter8,omitempty"`
+	Iter8 Iter8Config `json:"iter8,omitempty"`
 }
 type IstioAnnotations struct {
 	IstioInjectionAnnotation string `json:"istioInjectionAnnotation,omitempty"`
@@ -47,6 +46,8 @@ type PrometheusConfig struct {
 // PublicConfig is a subset of Kiali configuration that can be exposed to clients to
 // help them interact with the system.
 type PublicConfig struct {
+	ClusterInfo              ClusterInfo                     `json:"clusterInfo,omitempty"`
+	Clusters                 map[string]business.Cluster     `json:"clusters,omitempty"`
 	Extensions               Extensions                      `json:"extensions,omitempty"`
 	HealthConfig             config.HealthConfig             `json:"healthConfig,omitempty"`
 	InstallationTag          string                          `json:"installationTag,omitempty"`
@@ -56,7 +57,6 @@ type PublicConfig struct {
 	IstioNamespace           string                          `json:"istioNamespace,omitempty"`
 	IstioComponentNamespaces config.IstioComponentNamespaces `json:"istioComponentNamespaces,omitempty"`
 	IstioLabels              config.IstioLabels              `json:"istioLabels,omitempty"`
-	IstioTelemetryV2         bool                            `json:"istioTelemetryV2"`
 	IstioConfigMap           string                          `json:"istioConfigMap"`
 	KialiFeatureFlags        config.KialiFeatureFlags        `json:"kialiFeatureFlags,omitempty"`
 	Prometheus               PrometheusConfig                `json:"prometheus,omitempty"`
@@ -71,14 +71,8 @@ func Config(w http.ResponseWriter, r *http.Request) {
 	promConfig := getPrometheusConfig()
 	config := config.Get()
 	publicConfig := PublicConfig{
+		Clusters: make(map[string]business.Cluster),
 		Extensions: Extensions{
-			ThreeScale: ThreeScaleConfig{
-				AdapterName:    config.Extensions.ThreeScale.AdapterName,
-				AdapterPort:    config.Extensions.ThreeScale.AdapterPort,
-				AdapterService: config.Extensions.ThreeScale.AdapterService,
-				Enabled:        config.Extensions.ThreeScale.Enabled,
-				TemplateName:   config.Extensions.ThreeScale.TemplateName,
-			},
 			Iter8: Iter8Config{
 				Enabled:   config.Extensions.Iter8.Enabled,
 				Namespace: config.Extensions.Iter8.Namespace,
@@ -100,7 +94,47 @@ func Config(w http.ResponseWriter, r *http.Request) {
 			GlobalScrapeInterval: promConfig.GlobalScrapeInterval,
 			StorageTsdbRetention: promConfig.StorageTsdbRetention,
 		},
-		IstioTelemetryV2: status.IsMixerDisabled(),
+	}
+
+	// The following code fetches the cluster info. Cluster info is not critical.
+	// It's even possible that it cannot be resolved (because of Istio not being with MC turned on).
+	// Because of these two reasons, let's simply ignore errors in the following code.
+	token, getTokenErr := kubernetes.GetKialiToken()
+	if getTokenErr == nil {
+		layer, getLayerErr := business.Get(&api.AuthInfo{Token: token})
+		if getLayerErr == nil {
+			isMeshIdSet, mcErr := layer.Mesh.IsMeshConfigured()
+			if isMeshIdSet {
+				// Resolve home cluster
+				cluster, resolveClusterErr := layer.Mesh.ResolveKialiControlPlaneCluster(nil)
+				if cluster != nil {
+					publicConfig.ClusterInfo = ClusterInfo{
+						Name:    cluster.Name,
+						Network: cluster.Network,
+					}
+				} else if resolveClusterErr != nil {
+					log.Warningf("Failure while resolving cluster info: %s", resolveClusterErr.Error())
+				} else {
+					log.Info("Cluster ID couldn't be resolved. Most likely, no Cluster ID is set in the service mesh control plane configuration.")
+				}
+
+				// Fetch the list of all clusters in the mesh
+				// One usage of this data is to cross-link Kiali instances, when possible.
+				clusters, resolveAllClustersErr := layer.Mesh.GetClusters(r)
+				for _, c := range clusters {
+					publicConfig.Clusters[c.Name] = c
+				}
+				if resolveAllClustersErr != nil {
+					log.Warningf("Failure while listing clusters in the mesh: %s", resolveAllClustersErr.Error())
+				}
+			} else if mcErr != nil {
+				log.Warningf("Failure when checking if mesh-id is configured: %s", mcErr.Error())
+			}
+		} else {
+			log.Warningf("Failed to create business layer when resolving cluster info: %s", getLayerErr.Error())
+		}
+	} else {
+		log.Warningf("Failed to fetch Kiali token when resolving cluster info: %s", getTokenErr.Error())
 	}
 
 	RespondWithJSONIndent(w, http.StatusOK, publicConfig)

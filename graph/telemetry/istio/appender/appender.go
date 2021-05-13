@@ -6,9 +6,7 @@ import (
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/graph"
-	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
-	"github.com/kiali/kiali/status"
 )
 
 const (
@@ -16,21 +14,8 @@ const (
 	defaultQuantile  = 0.95
 )
 
-// version-specific telemetry field names.  Because the istio version can change outside of the kiali pod,
-// these values may change and are therefore re-set on every graph request.
-var appLabel = "app"
-var verLabel = "version"
-
-func setLabels() {
-	if status.AreCanonicalMetricsAvailable() {
-		appLabel = "canonical_service"
-		verLabel = "canonical_revision"
-	}
-}
-
 // ParseAppenders determines which appenders should run for this graphing request
 func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
-	setLabels()
 
 	requestedAppenders := make(map[string]bool)
 	if !o.Appenders.All {
@@ -40,6 +25,10 @@ func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
 				requestedAppenders[AggregateNodeAppenderName] = true
 			case DeadNodeAppenderName:
 				requestedAppenders[DeadNodeAppenderName] = true
+			case HealthConfigAppenderName:
+				requestedAppenders[HealthConfigAppenderName] = true
+			case IdleNodeAppenderName:
+				requestedAppenders[IdleNodeAppenderName] = true
 			case IstioAppenderName:
 				requestedAppenders[IstioAppenderName] = true
 			case ResponseTimeAppenderName:
@@ -50,8 +39,6 @@ func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
 				requestedAppenders[ServiceEntryAppenderName] = true
 			case SidecarsCheckAppenderName:
 				requestedAppenders[SidecarsCheckAppenderName] = true
-			case UnusedNodeAppenderName:
-				requestedAppenders[UnusedNodeAppenderName] = true
 			case "":
 				// skip
 			default:
@@ -63,9 +50,9 @@ func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
 	// The appender order is important
 	// To pre-process service nodes run service_entry appender first
 	// To reduce processing, filter dead nodes next
-	// To reduce processing, next run appenders that don't apply to unused services
+	// To reduce processing, next run appenders that don't apply to idle (aka unused) services
 	// - lazily inject aggregate nodes so other decorations can influence the new nodes/edges, if necessary
-	// Add orphan (unused) services
+	// Add orphan (idle) services
 	// Run remaining appenders
 	var appenders []graph.Appender
 
@@ -125,9 +112,13 @@ func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
 		}
 		appenders = append(appenders, a)
 	}
-	if _, ok := requestedAppenders[UnusedNodeAppenderName]; ok || o.Appenders.All {
+	if _, ok := requestedAppenders[HealthConfigAppenderName]; ok || o.Appenders.All {
+		a := HealthConfigAppender{}
+		appenders = append(appenders, a)
+	}
+	if _, ok := requestedAppenders[IdleNodeAppenderName]; ok || o.Appenders.All {
 		hasNodeOptions := o.App != "" || o.Workload != "" || o.Service != ""
-		a := UnusedNodeAppender{
+		a := IdleNodeAppender{
 			GraphType:          o.GraphType,
 			InjectServiceNodes: o.InjectServiceNodes,
 			IsNodeGraph:        hasNodeOptions,
@@ -139,7 +130,9 @@ func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
 		appenders = append(appenders, a)
 	}
 	if _, ok := requestedAppenders[SidecarsCheckAppenderName]; ok || o.Appenders.All {
-		a := SidecarsCheckAppender{}
+		a := SidecarsCheckAppender{
+			AccessibleNamespaces: o.AccessibleNamespaces,
+		}
 		appenders = append(appenders, a)
 	}
 
@@ -147,34 +140,71 @@ func ParseAppenders(o graph.TelemetryOptions) []graph.Appender {
 }
 
 const (
-	serviceDefinitionListKey = "serviceDefinitionListKey" // namespace vendor info
-	serviceEntryHostsKey     = "serviceEntryHosts"        // global vendor info
-	workloadListKey          = "workloadList"             // namespace vendor info
+	serviceDefinitionListKey = "serviceDefinitionListKey" // global vendor info map[namespace]serviceDefinitionList
+	serviceEntryHostsKey     = "serviceEntryHostsKey"     // global vendor info service entries for all accessible namespaces
+	workloadListKey          = "workloadListKey"          // global vendor info map[namespace]workloadListKey
 )
 
 type serviceEntry struct {
-	location string
-	name     string // serviceEntry name
+	exportTo  interface{}
+	hosts     []string
+	location  string
+	name      string // serviceEntry name
+	namespace string // namespace in which the service entry is defined
 }
 
-type serviceEntryHosts map[string]*serviceEntry
+type serviceEntryHosts map[string][]*serviceEntry
 
 func newServiceEntryHosts() serviceEntryHosts {
-	return make(map[string]*serviceEntry)
+	return make(map[string][]*serviceEntry)
 }
 
 func (seh serviceEntryHosts) addHost(host string, se *serviceEntry) {
-	if existingSe, ok := seh[host]; ok {
-		log.Warningf("Same host [%s] found in ServiceEntry [%s] and [%s]", host, existingSe.name, se.name)
+	seArr := []*serviceEntry{se}
+	if serviceEntriesForHost, ok := seh[host]; ok {
+		// if the same host is defined in multiple service entries, prefer the most
+		// specific namespace match when checking for a match...
+		if se.exportTo == nil || se.exportTo.([]interface{})[0] == '*' {
+			seh[host] = append(serviceEntriesForHost, seArr...)
+		} else {
+			seh[host] = append(seArr, serviceEntriesForHost...)
+		}
+	} else {
+		seh[host] = seArr
 	}
-	seh[host] = se
+	se.hosts = append(se.hosts, host)
 }
 
-func getServiceDefinitionList(ni *graph.AppenderNamespaceInfo) *models.ServiceDefinitionList {
-	if sdl, ok := ni.Vendor[serviceDefinitionListKey]; ok {
-		return sdl.(*models.ServiceDefinitionList)
+func getServiceDefinitionList(namespace string, gi *graph.AppenderGlobalInfo) *models.ServiceDefinitionList {
+	var serviceDefinitionListMap map[string]*models.ServiceDefinitionList
+	if existingServiceDefinitionMap, ok := gi.Vendor[serviceDefinitionListKey]; ok {
+		serviceDefinitionListMap = existingServiceDefinitionMap.(map[string]*models.ServiceDefinitionList)
+	} else {
+		serviceDefinitionListMap = make(map[string]*models.ServiceDefinitionList)
+		gi.Vendor[serviceDefinitionListKey] = serviceDefinitionListMap
 	}
-	return nil
+
+	if serviceDefinitionList, ok := serviceDefinitionListMap[namespace]; ok {
+		return serviceDefinitionList
+	}
+
+	serviceDefinitionList, err := gi.Business.Svc.GetServiceDefinitionList(namespace)
+	graph.CheckError(err)
+	serviceDefinitionListMap[namespace] = serviceDefinitionList
+
+	return serviceDefinitionList
+}
+
+func getServiceDefinition(namespace, serviceName string, gi *graph.AppenderGlobalInfo) (*models.Service, bool) {
+	if serviceName == "" || serviceName == graph.Unknown {
+		return nil, false
+	}
+	for _, srv := range getServiceDefinitionList(namespace, gi).ServiceDefinitions {
+		if srv.Service.Name == serviceName {
+			return &srv.Service, true
+		}
+	}
+	return nil, false
 }
 
 func getServiceEntryHosts(gi *graph.AppenderGlobalInfo) (serviceEntryHosts, bool) {
@@ -184,19 +214,34 @@ func getServiceEntryHosts(gi *graph.AppenderGlobalInfo) (serviceEntryHosts, bool
 	return newServiceEntryHosts(), false
 }
 
-func getWorkloadList(ni *graph.AppenderNamespaceInfo) *models.WorkloadList {
-	if wll, ok := ni.Vendor[workloadListKey]; ok {
-		return wll.(*models.WorkloadList)
+func getWorkloadList(namespace string, gi *graph.AppenderGlobalInfo) *models.WorkloadList {
+	var workloadListMap map[string]*models.WorkloadList
+	if existingWorkloadMap, ok := gi.Vendor[workloadListKey]; ok {
+		workloadListMap = existingWorkloadMap.(map[string]*models.WorkloadList)
+	} else {
+		workloadListMap = make(map[string]*models.WorkloadList)
+		gi.Vendor[workloadListKey] = workloadListMap
 	}
-	return nil
+
+	if workloadList, ok := workloadListMap[namespace]; ok {
+		return workloadList
+	}
+
+	workloadList, err := gi.Business.Workload.GetWorkloadList(namespace)
+	graph.CheckError(err)
+	workloadListMap[namespace] = &workloadList
+
+	return &workloadList
 }
 
-func getWorkload(workloadName string, ni *graph.AppenderNamespaceInfo) (*models.WorkloadListItem, bool) {
+func getWorkload(namespace, workloadName string, gi *graph.AppenderGlobalInfo) (*models.WorkloadListItem, bool) {
 	if workloadName == "" || workloadName == graph.Unknown {
 		return nil, false
 	}
 
-	for _, workload := range getWorkloadList(ni).Workloads {
+	workloadList := getWorkloadList(namespace, gi)
+
+	for _, workload := range workloadList.Workloads {
 		if workload.Name == workloadName {
 			return &workload, true
 		}
@@ -204,14 +249,14 @@ func getWorkload(workloadName string, ni *graph.AppenderNamespaceInfo) (*models.
 	return nil, false
 }
 
-func getAppWorkloads(app, version string, ni *graph.AppenderNamespaceInfo) []models.WorkloadListItem {
+func getAppWorkloads(namespace, app, version string, gi *graph.AppenderGlobalInfo) []models.WorkloadListItem {
 	cfg := config.Get()
 	appLabel := cfg.IstioLabels.AppLabelName
 	versionLabel := cfg.IstioLabels.VersionLabelName
 
 	result := []models.WorkloadListItem{}
-	versionOk := graph.IsOK(version)
-	for _, workload := range getWorkloadList(ni).Workloads {
+	versionOk := graph.IsOKVersion(version)
+	for _, workload := range getWorkloadList(namespace, gi).Workloads {
 		if appVal, ok := workload.Labels[appLabel]; ok && app == appVal {
 			if !versionOk {
 				result = append(result, workload)

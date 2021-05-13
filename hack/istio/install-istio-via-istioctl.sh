@@ -14,22 +14,28 @@
 
 # ISTIO_DIR is where the Istio download is installed and thus where the istioctl binary is found.
 # CLIENT_EXE_NAME must be either "oc" or "kubectl"
+ADDONS="prometheus grafana jaeger"
+CLIENT_EXE_NAME="oc"
+CLUSTER_NAME="cluster-default"
+CONFIG_PROFILE="demo" # see "istioctl profile list" for valid values. See: https://istio.io/docs/setup/additional-setup/config-profiles/
+DELETE_ISTIO="false"
 ISTIOCTL=
 ISTIO_DIR=
-CLIENT_EXE_NAME="oc"
-NAMESPACE="istio-system"
-MTLS="true"
-DELETE_ISTIO="false"
 ISTIO_EGRESSGATEWAY_ENABLED="true"
-CONFIG_PROFILE="demo" # see "istioctl profile list" for valid values. See: https://istio.io/docs/setup/additional-setup/config-profiles/
-ADDONS="prometheus grafana jaeger"
+ISTIO_INGRESSGATEWAY_ENABLED="true"
+MESH_ID="mesh-default"
+MTLS="true"
+NAMESPACE="istio-system"
+NETWORK="network-default"
+IMAGE_HUB="gcr.io/istio-release"
+IMAGE_TAG="default"
 
 # process command line args
 while [[ $# -gt 0 ]]; do
   key="$1"
   case $key in
     -a|--addons)
-      ADDONS="prometheus $2"
+      ADDONS="$2"
       shift;shift
       ;;
     -c|--client-exe)
@@ -38,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -cep|--client-exe-path)
       CLIENT_EXE="$2"
+      shift;shift
+      ;;
+    -cn|--cluster-name)
+      CLUSTER_NAME="$2"
       shift;shift
       ;;
     -cp|--config-profile)
@@ -70,6 +80,27 @@ while [[ $# -gt 0 ]]; do
       fi
       shift;shift
       ;;
+    -iie|--istio-ingressgateway-enabled)
+      if [ "${2}" == "true" ] || [ "${2}" == "false" ]; then
+        ISTIO_INGRESSGATEWAY_ENABLED="$2"
+      else
+        echo "ERROR: The --istio-ingressgateway-enabled flag must be 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -ih|--image-hub)
+      IMAGE_HUB="$2"
+      shift;shift
+      ;;
+    -it|--image-tag)
+      IMAGE_TAG="$2"
+      shift;shift
+      ;;
+    -mid|--mesh-id)
+      MESH_ID="$2"
+      shift;shift
+      ;;
     -m|--mtls)
       if [ "${2}" == "true" ] || [ "${2}" == "false" ]; then
         MTLS="$2"
@@ -83,6 +114,10 @@ while [[ $# -gt 0 ]]; do
       NAMESPACE="$2"
       shift;shift
       ;;
+    -net|--network)
+      NETWORK="$2"
+      shift;shift
+      ;;
     -s|--set)
       CUSTOM_INSTALL_SETTINGS="${CUSTOM_INSTALL_SETTINGS} --set $2"
       shift;shift
@@ -94,7 +129,6 @@ Valid command line arguments:
        The names of the addons you want to install along with the core Istio components.
        Make sure this value is space-separated. Valid addon names can be found in your Istio
        distribution directory samples/addons.
-       Note that "prometheus" will always be added to the list of addons, so you do not have to specify it.
        Default: prometheus grafana jaeger
   -c|--client-exe <name>:
        Cluster client executable name - valid values are "kubectl" or "oc".
@@ -102,6 +136,9 @@ Valid command line arguments:
   -cep|--client-exe-path <full path to client exec>:
        Cluster client executable path - e.g. "/bin/kubectl" or "minikube kubectl --"
        This value overrides any other value set with --client-exe
+  -cn|--cluster-name <cluster name>:
+       Installs istio as part of cluster with the given name.
+       Default: cluster-default
   -cp|--config-profile <profile name>:
        Installs Istio with the given profile.
        Run "istioctl profile list" to see the valid list of configuration profiles available.
@@ -118,17 +155,34 @@ Valid command line arguments:
   -iee|--istio-egressgateway-enabled (true|false)
        When set to true, istio-egressgateway will be installed.
        Default: true
+  -iie|--istio-ingressgateway-enabled (true|false)
+       When set to true, istio-ingressgateway will be installed.
+       Default: true
+  -ih|--image-hub <hub id>
+       The hub where the Istio images will be pulled from.
+       You can set this to "default" in order to use the default hub that the Istio charts use but
+       this may be using docker.io and docker hub rate limiting may cause the installation to fail.
+       Default: gcr.io/istio-release
+  -it|--image-tag <tag>
+       The tag of the Istio images. Leave this as "default" (which means the default images are pulled)
+       unless you know the image tag you are pulling is compatible with the charts in the istioctl installer.
+       You will need this if you have a dev version of istioctl but want to pull a released version of the images.
+       Default: "default"
   -m|--mtls (true|false):
        Indicate if you want global MTLS auto enabled.
        Default: false
+  -mid|--mesh-id <mesh ID>:
+       Installs istio as part of mesh with the given name.
+       Default: mesh-default
   -n|--namespace <name>:
        Install Istio in this namespace.
        Default: istio-system
+  -net|--network <network>:
+       Installs istio as part of network with the given name.
+       Default: network-default
   -s|--set <name=value>:
        Sets a name/value pair for a custom install setting. Some examples you may want to use:
        --set installPackagePath=/git/clone/istio.io/installer
-       --set components.telemetry.k8s.resources.requests.memory=100Mi
-       --set components.telemetry.k8s.resources.requests.cpu=50m
   -h|--help:
        this message
 HELPMSG
@@ -184,43 +238,66 @@ echo "istioctl is found here: ${ISTIOCTL}"
 
 # If OpenShift, install CNI
 if [[ "${CLIENT_EXE}" = *"oc" ]]; then
-  # Istio 1.4 had different option names than 1.5+
-  if ${ISTIOCTL} --remote=false version | grep -q "1\.4" ; then
-    CNI_OPTIONS="--set cni.enabled=true --set cni.components.cni.enabled=true --set cni.components.cni.namespace=kube-system --set values.cni.cniBinDir=/var/lib/cni/bin --set values.cni.cniConfDir=/var/run/multus/cni/net.d"
-    TELEMETRY_OPTIONS="--set telemetry.components.telemetry.k8s.resources.requests.memory=100Mi --set telemetry.components.telemetry.k8s.resources.requests.cpu=50m"
-  else
-    CNI_OPTIONS="--set components.cni.enabled=true --set components.cni.namespace=kube-system --set values.cni.cniBinDir=/var/lib/cni/bin --set values.cni.cniConfDir=/etc/cni/multus/net.d --set values.cni.chained=false --set values.cni.cniConfFileName=istio-cni.conf --set values.sidecarInjectorWebhook.injectedAnnotations.k8s\.v1\.cni\.cncf\.io/networks=istio-cni"
-    TELEMETRY_OPTIONS="--set components.telemetry.k8s.resources.requests.memory=100Mi --set components.telemetry.k8s.resources.requests.cpu=50m"
+  CNI_OPTIONS="--set components.cni.enabled=true --set components.cni.namespace=kube-system --set values.cni.cniBinDir=/var/lib/cni/bin --set values.cni.cniConfDir=/etc/cni/multus/net.d --set values.cni.chained=false --set values.cni.cniConfFileName=istio-cni.conf --set values.sidecarInjectorWebhook.injectedAnnotations.k8s\.v1\.cni\.cncf\.io/networks=istio-cni"
 
-    # Istio 1.5 used global.mtls.auto, 1.6 renamed it
-    if ${ISTIOCTL} --remote=false version | grep -q "1\.5" ; then
-      MTLS_OPTIONS="--set values.global.mtls.auto=${MTLS}"
-    else
-      MTLS_OPTIONS="--set values.meshConfig.enableAutoMtls=${MTLS}"
-    fi
-    MTLS_OPTIONS="${MTLS_OPTIONS} --set values.global.controlPlaneSecurityEnabled=${MTLS}"
+  # Istio 1.8 removed mixer - so components.telemetry settings are only valid from 1.7 and earlier.
+  if ${ISTIOCTL} --remote=false version | grep -q "1\.6\|1\.7" ; then
+    TELEMETRY_OPTIONS="--set components.telemetry.k8s.resources.requests.memory=100Mi --set components.telemetry.k8s.resources.requests.cpu=50m"
   fi
+
+  MTLS_OPTIONS="--set values.meshConfig.enableAutoMtls=${MTLS}"
 fi
 
 # When installing Istio (i.e. not deleting it) perform some preparation steps
 if [ "${DELETE_ISTIO}" != "true" ]; then
   # Create the istio-system namespace
   # If OpenShift, we need to do some additional things - see:
-  #   https://istio.io/docs/setup/kubernetes/platform-setup/openshift/
+  #   https://istio.io/latest/docs/setup/platform-setup/openshift/
   echo Creating the control plane namespace: ${NAMESPACE}
   if [[ "${CLIENT_EXE}" = *"oc" ]]; then
-    ${CLIENT_EXE} new-project ${NAMESPACE}
+    if ! ${CLIENT_EXE} get namespace ${NAMESPACE}; then
+      ${CLIENT_EXE} new-project ${NAMESPACE}
+    fi
 
     echo Performing additional commands for OpenShift
-    ${CLIENT_EXE} adm policy add-scc-to-group anyuid system:serviceaccounts -n ${NAMESPACE}
+    ${CLIENT_EXE} adm policy add-scc-to-group anyuid system:serviceaccounts:${NAMESPACE}
   else
-    ${CLIENT_EXE} create namespace ${NAMESPACE}
+    if ! ${CLIENT_EXE} get namespace ${NAMESPACE}; then
+      ${CLIENT_EXE} create namespace ${NAMESPACE}
+    fi
+  fi
+
+  echo "Labeling namespace with network name [${NETWORK}]"
+  ${CLIENT_EXE} label --overwrite namespace ${NAMESPACE} topology.istio.io/network=${NETWORK}
+fi
+
+if [ "${IMAGE_HUB}" != "default" ]; then
+  IMAGE_HUB_OPTION="--set hub=${IMAGE_HUB}"
+fi
+
+if [ "${IMAGE_TAG}" != "default" ]; then
+  IMAGE_TAG_OPTION="--set tag=${IMAGE_TAG}"
+fi
+
+if [ "${NAMESPACE}" != "istio-system" ]; then
+  # see https://github.com/istio/istio/issues/30897 for these settings
+  CUSTOM_NAMESPACE_OPTIONS="--set namespace=${NAMESPACE}"
+  CUSTOM_NAMESPACE_OPTIONS="${CUSTOM_NAMESPACE_OPTIONS} --set values.global.istioNamespace=${NAMESPACE}"
+  if [[ "${CLIENT_EXE}" = *"oc" ]]; then
+    CNI_OPTIONS="${CNI_OPTIONS} --set values.cni.excludeNamespaces[0]=${NAMESPACE}"
   fi
 fi
 
 for s in \
+   "${IMAGE_HUB_OPTION}" \
+   "${IMAGE_TAG_OPTION}" \
    "${MTLS_OPTIONS}" \
+   "${CUSTOM_NAMESPACE_OPTIONS}" \
    "--set values.gateways.istio-egressgateway.enabled=${ISTIO_EGRESSGATEWAY_ENABLED}" \
+   "--set values.gateways.istio-ingressgateway.enabled=${ISTIO_INGRESSGATEWAY_ENABLED}" \
+   "--set values.global.meshID=${MESH_ID}" \
+   "--set values.global.multiCluster.clusterName=${CLUSTER_NAME}" \
+   "--set values.global.network=${NETWORK}" \
    "${CNI_OPTIONS}" \
    "${TELEMETRY_OPTIONS}" \
    "${CUSTOM_INSTALL_SETTINGS}"
@@ -237,41 +314,59 @@ if [ "${DELETE_ISTIO}" == "true" ]; then
   echo Deleting Addons
   for addon in $(ls -1 ${ISTIO_DIR}/samples/addons/*.yaml); do
     echo "Deleting addon [${addon}]"
-    ${CLIENT_EXE} delete --ignore-not-found=true -f ${addon}
+    cat ${addon} | sed "s/istio-system/${NAMESPACE}/g" | ${CLIENT_EXE} delete --ignore-not-found=true -n ${NAMESPACE} -f -
   done
 
   echo Deleting Core Istio
   ${ISTIOCTL} manifest generate --set profile=${CONFIG_PROFILE} ${MANIFEST_CONFIG_SETTINGS_TO_APPLY} | ${CLIENT_EXE} delete -f -
   if [[ "${CLIENT_EXE}" = *"oc" ]]; then
     echo "===== IMPORTANT ====="
-    echo "For each namespace in the mesh, run these commands to remove previously created policies:"
-    echo "  oc adm policy remove-scc-from-group privileged system:serviceaccounts:<target-namespace>"
-    echo "  oc adm policy remove-scc-from-group anyuid system:serviceaccounts:<target-namespace>"
+    echo "For each namespace in the mesh, run these commands to remove previously created resources:"
     echo "  oc -n <target-namespace> delete network-attachment-definition istio-cni"
     echo "===== IMPORTANT ====="
   fi
+
+  echo "Deleting the istio namespace [${NAMESPACE}]"
+  ${CLIENT_EXE} delete namespace ${NAMESPACE}
 else
   echo Installing Istio...
-  ${ISTIOCTL} manifest install --set profile=${CONFIG_PROFILE} ${MANIFEST_CONFIG_SETTINGS_TO_APPLY}
-  if [ "$?" != "0" ]; then
-    echo "Failed to install Istio with profile [${CONFIG_PROFILE}]"
-    exit 1
+  # There is a bug in istioctl manifest install - it wants to always create the CR in istio-system.
+  # If we are not installing in istio-system, we cannot use 'install' but must generate the yaml and apply it ourselves.
+  # See https://github.com/istio/istio/issues/30897#issuecomment-781141490
+  if [ "${NAMESPACE}" == "istio-system" ]; then
+    while ! (${ISTIOCTL} manifest install --skip-confirmation=true --set profile=${CONFIG_PROFILE} ${MANIFEST_CONFIG_SETTINGS_TO_APPLY})
+    do
+      echo "Failed to install Istio with profile [${CONFIG_PROFILE}]. Will retry in 10 seconds..."
+      sleep 10
+    done
+  else
+    while ! (${ISTIOCTL} manifest generate --set profile=${CONFIG_PROFILE} ${MANIFEST_CONFIG_SETTINGS_TO_APPLY} | ${CLIENT_EXE} apply -f -)
+    do
+      echo "Failed to install Istio with profile [${CONFIG_PROFILE}]. Will retry in 10 seconds..."
+      sleep 10
+    done
   fi
 
   echo "Installing Addons: [${ADDONS}]"
   for addon in ${ADDONS}; do
     echo "Installing addon: [${addon}]"
-    ${CLIENT_EXE} apply -f ${ISTIO_DIR}/samples/addons/${addon}.yaml
+    while ! (cat ${ISTIO_DIR}/samples/addons/${addon}.yaml | sed "s/istio-system/${NAMESPACE}/g" | ${CLIENT_EXE} apply -n ${NAMESPACE} -f -)
+    do
+      echo "Failed to install addon [${addon}] - will retry in 10 seconds..."
+      sleep 10
+    done
   done
 
   # Do some OpenShift specific things
   if [[ "${CLIENT_EXE}" = *"oc" ]]; then
-    ${CLIENT_EXE} -n ${NAMESPACE} expose svc/istio-ingressgateway --port=http2
+    if [ "${ISTIO_INGRESSGATEWAY_ENABLED}" == "true" ]; then
+      ${CLIENT_EXE} -n ${NAMESPACE} expose svc/istio-ingressgateway --port=http2
+    else
+      echo "Ingressgateway is disabled - the OpenShift Route will not be created"
+    fi
 
     echo "===== IMPORTANT ====="
-    echo "For each namespace in the mesh, run these commands so sidecar injection works:"
-    echo "  oc adm policy add-scc-to-group privileged system:serviceaccounts:<target-namespace>"
-    echo "  oc adm policy add-scc-to-group anyuid system:serviceaccounts:<target-namespace>"
+    echo "For each namespace in the mesh, run these commands to create the necessary resources:"
     cat <<NAD
   cat <<EOF | oc -n <target-namespace> create -f -
 apiVersion: "k8s.cni.cncf.io/v1"

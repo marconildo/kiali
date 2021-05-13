@@ -56,7 +56,7 @@ func FilterPodsForController(controllerName string, controllerType string, allPo
 	var pods []core_v1.Pod
 	for _, pod := range allPods {
 		for _, ref := range pod.OwnerReferences {
-			if ref.Controller != nil && *ref.Controller && ref.Name == controllerName && ref.Kind == controllerType {
+			if ref.Controller != nil && *ref.Controller && strings.HasPrefix(ref.Name, controllerName) && ref.Kind == controllerType {
 				pods = append(pods, pod)
 				break
 			}
@@ -69,6 +69,16 @@ func FilterServicesForSelector(selector labels.Selector, allServices []core_v1.S
 	var services []core_v1.Service
 	for _, svc := range allServices {
 		if selector.Matches(labels.Set(svc.Spec.Selector)) {
+			services = append(services, svc)
+		}
+	}
+	return services
+}
+
+func FilterServicesByLabels(selector labels.Selector, allServices []core_v1.Service) []core_v1.Service {
+	var services []core_v1.Service
+	for _, svc := range allServices {
+		if selector.Matches(labels.Set(svc.ObjectMeta.Labels)) {
 			services = append(services, svc)
 		}
 	}

@@ -1,11 +1,14 @@
 package kubernetes
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"gopkg.in/yaml.v2"
 	core_v1 "k8s.io/api/core/v1"
@@ -17,6 +20,8 @@ import (
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/util/config_dump"
+	"github.com/kiali/kiali/util/httputil"
 )
 
 var (
@@ -24,20 +29,20 @@ var (
 	portProtocols   = [...]string{"grpc", "http", "http2", "https", "mongo", "redis", "tcp", "tls", "udp", "mysql"}
 )
 
+type IstioClientInterface interface {
+	CreateIstioObject(api, namespace, resourceType, json string) (IstioObject, error)
+	DeleteIstioObject(api, namespace, resourceType, name string) error
+	GetIstioObject(namespace, resourceType, name string) (IstioObject, error)
+	GetIstioObjects(namespace, resourceType, labelSelector string) ([]IstioObject, error)
+	UpdateIstioObject(api, namespace, resourceType, name, jsonPatch string) (IstioObject, error)
+	GetProxyStatus() ([]*ProxyStatus, error)
+	GetConfigDump(namespace, podName string) (*ConfigDump, error)
+}
+
 // Aux method to fetch proper (RESTClient, APIVersion) per API group
 func (in *K8SClient) getApiClientVersion(apiGroup string) (*rest.RESTClient, string) {
-	if apiGroup == ConfigGroupVersion.Group {
-		return in.istioConfigApi, ApiConfigVersion
-	} else if apiGroup == NetworkingGroupVersion.Group {
+	if apiGroup == NetworkingGroupVersion.Group {
 		return in.istioNetworkingApi, ApiNetworkingVersion
-	} else if apiGroup == AuthenticationGroupVersion.Group {
-		return in.istioAuthenticationApi, ApiAuthenticationVersion
-	} else if apiGroup == RbacGroupVersion.Group {
-		return in.istioRbacApi, ApiRbacVersion
-	} else if apiGroup == MaistraAuthenticationGroupVersion.Group {
-		return in.maistraAuthenticationApi, ApiMaistraAuthenticationVersion
-	} else if apiGroup == MaistraRbacGroupVersion.Group {
-		return in.maistraRbacApi, ApiMaistraRbacVersion
 	} else if apiGroup == SecurityGroupVersion.Group {
 		return in.istioSecurityApi, ApiSecurityVersion
 	}
@@ -62,14 +67,7 @@ func (in *K8SClient) CreateIstioObject(api, namespace, resourceType, json string
 		return nil, fmt.Errorf("%s is not supported in CreateIstioObject operation", api)
 	}
 
-	// MeshPeerAuthentications and ClusterRbacConfigs are cluster scope objects
-	// Update: Removed the namespace filter as it doesn't work well in all platforms
-	// https://issues.jboss.org/browse/KIALI-3223
-	if resourceType == MeshPolicies || resourceType == ClusterRbacConfigs {
-		result, err = apiClient.Post().Resource(resourceType).Body(byteJson).Do().Get()
-	} else {
-		result, err = apiClient.Post().Namespace(namespace).Resource(resourceType).Body(byteJson).Do().Get()
-	}
+	result, err = apiClient.Post().Namespace(namespace).Resource(resourceType).Body(byteJson).Do(in.ctx).Get()
 	if err != nil {
 		return nil, err
 	}
@@ -90,14 +88,7 @@ func (in *K8SClient) DeleteIstioObject(api, namespace, resourceType, name string
 	if apiClient == nil {
 		return fmt.Errorf("%s is not supported in DeleteIstioObject operation", api)
 	}
-	// MeshPeerAuthentications and ClusterRbacConfigs are cluster scope objects
-	// Update: Removed the namespace filter as it doesn't work well in all platforms
-	// https://issues.jboss.org/browse/KIALI-3223
-	if resourceType == MeshPolicies || resourceType == ClusterRbacConfigs {
-		_, err = apiClient.Delete().Resource(resourceType).Name(name).Do().Get()
-	} else {
-		_, err = apiClient.Delete().Namespace(namespace).Resource(resourceType).Name(name).Do().Get()
-	}
+	_, err = apiClient.Delete().Namespace(namespace).Resource(resourceType).Name(name).Do(in.ctx).Get()
 	return err
 }
 
@@ -118,14 +109,7 @@ func (in *K8SClient) UpdateIstioObject(api, namespace, resourceType, name, jsonP
 	if apiClient == nil {
 		return nil, fmt.Errorf("%s is not supported in UpdateIstioObject operation", api)
 	}
-	// MeshPeerAuthentications and ClusterRbacConfigs are cluster scope objects
-	// Update: Removed the namespace filter as it doesn't work well in all platforms
-	// https://issues.jboss.org/browse/KIALI-3223
-	if resourceType == MeshPolicies || resourceType == ClusterRbacConfigs {
-		result, err = apiClient.Patch(types.MergePatchType).Resource(resourceType).SubResource(name).Body(bytePatch).Do().Get()
-	} else {
-		result, err = apiClient.Patch(types.MergePatchType).Namespace(namespace).Resource(resourceType).SubResource(name).Body(bytePatch).Do().Get()
-	}
+	result, err = apiClient.Patch(types.MergePatchType).Namespace(namespace).Resource(resourceType).SubResource(name).Body(bytePatch).Do(in.ctx).Get()
 	if err != nil {
 		return nil, err
 	}
@@ -151,29 +135,13 @@ func (in *K8SClient) GetIstioObjects(namespace, resourceType, labelSelector stri
 		return []IstioObject{}, nil
 	}
 
-	if apiGroup == ConfigGroupVersion.Group && !in.hasConfigResource(resourceType) {
-		return []IstioObject{}, nil
-	}
-
-	if apiGroup == AuthenticationGroupVersion.Group && !in.hasAuthenticationResource(resourceType) {
-		return []IstioObject{}, nil
-	}
-
-	if apiGroup == RbacGroupVersion.Group && !in.hasRbacResource(resourceType) {
-		return []IstioObject{}, nil
-	}
-
 	if apiGroup == SecurityGroupVersion.Group && !in.hasSecurityResource(resourceType) {
 		return []IstioObject{}, nil
 	}
 
 	var result runtime.Object
 	var err error
-	if resourceType == MeshPolicies || resourceType == ClusterRbacConfigs {
-		result, err = apiClient.Get().Resource(resourceType).Param("labelSelector", labelSelector).Do().Get()
-	} else {
-		result, err = apiClient.Get().Namespace(namespace).Resource(resourceType).Param("labelSelector", labelSelector).Do().Get()
-	}
+	result, err = apiClient.Get().Namespace(namespace).Resource(resourceType).Param("labelSelector", labelSelector).Do(in.ctx).Get()
 	if err != nil {
 		return nil, err
 	}
@@ -206,11 +174,7 @@ func (in *K8SClient) GetIstioObject(namespace, resourceType, name string) (Istio
 
 	var result runtime.Object
 	var err error
-	if resourceType == MeshPolicies || resourceType == ClusterRbacConfigs {
-		result, err = apiClient.Get().Resource(resourceType).SubResource(name).Do().Get()
-	} else {
-		result, err = apiClient.Get().Namespace(namespace).Resource(resourceType).SubResource(name).Do().Get()
-	}
+	result, err = apiClient.Get().Namespace(namespace).Resource(resourceType).SubResource(name).Do(in.ctx).Get()
 	if err != nil {
 		return nil, err
 	}
@@ -250,37 +214,76 @@ type SyncStatus struct {
 func (in *K8SClient) GetProxyStatus() ([]*ProxyStatus, error) {
 	c := config.Get()
 	istiods, err := in.GetPods(c.IstioNamespace, labels.Set(map[string]string{
-		c.IstioLabels.AppLabelName: "istiod",
+		"app": "istiod",
 	}).String())
 
 	if err != nil {
 		return nil, err
 	}
 
-	if len(istiods) == 0 {
-		return nil, errors.New("unable to find any Pilot instances")
+	healthyIstiods := make([]*core_v1.Pod, 0, len(istiods))
+	for i, istiod := range istiods {
+		if istiod.Status.Phase == "Running" {
+			healthyIstiods = append(healthyIstiods, &istiods[i])
+		}
 	}
+
+	if len(healthyIstiods) == 0 {
+		return nil, errors.New("unable to find any healthy Pilot instance")
+	}
+
+	// Check if the kube-api has proxy access to pods in the istio-system
+	// https://github.com/kiali/kiali/issues/3494#issuecomment-772486224
+	_, err = in.GetPodProxy(c.IstioNamespace, istiods[0].Name, "/ready")
+	if err != nil {
+		return nil, fmt.Errorf("unable to proxy Istiod pods. " +
+			"Make sure your Kubernetes API server has access to the Istio control plane through 8080 port")
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(healthyIstiods))
+	errChan := make(chan error, len(healthyIstiods))
+	syncChan := make(chan map[string][]byte, len(healthyIstiods))
 
 	result := map[string][]byte{}
-	for _, istiod := range istiods {
-		res, err := in.k8s.CoreV1().RESTClient().Get().
-			Namespace(istiod.Namespace).
-			Resource("pods").
-			SubResource("proxy").
-			Name(istiod.Name).
-			Suffix("/debug/syncz").
-			DoRaw()
+	for _, istiod := range healthyIstiods {
+		go func(name, namespace string) {
+			defer wg.Done()
 
-		if err != nil {
-			return nil, err
+			res, err := in.GetPodProxy(namespace, name, "/debug/syncz")
+			if err != nil {
+				errChan <- fmt.Errorf("%s: %s", name, err.Error())
+			} else {
+				syncChan <- map[string][]byte{name: res}
+			}
+		}(istiod.Name, istiod.Namespace)
+	}
+
+	wg.Wait()
+	close(errChan)
+	close(syncChan)
+
+	errs := ""
+	for err := range errChan {
+		if errs != "" {
+			errs = errs + "; "
 		}
+		errs = errs + err.Error()
+	}
+	errs = "Error fetching the proxy-status in the following pods: " + errs
 
-		if len(res) > 0 {
-			result[istiod.Name] = res
+	for status := range syncChan {
+		for pilot, sync := range status {
+			result[pilot] = sync
 		}
 	}
 
-	return getStatus(result)
+	// If there is one sync, we consider it as valid
+	if len(result) > 0 {
+		return getStatus(result)
+	}
+
+	return nil, errors.New(errs)
 }
 
 func getStatus(statuses map[string][]byte) ([]*ProxyStatus, error) {
@@ -299,6 +302,67 @@ func getStatus(statuses map[string][]byte) ([]*ProxyStatus, error) {
 	return fullStatus, nil
 }
 
+func (in *K8SClient) GetConfigDump(namespace, podName string) (*ConfigDump, error) {
+	// Fetching the config_dump data, raw.
+	resp, err := in.EnvoyForward(namespace, podName, "/config_dump")
+	if err != nil {
+		log.Errorf("Error fetching config_map: %v", err)
+		return nil, err
+	}
+
+	cd := &ConfigDump{}
+	err = json.Unmarshal(resp, cd)
+	if err != nil {
+		log.Errorf("Error Unmarshalling the config_dump: %v", err)
+	}
+
+	return cd, err
+}
+
+func (in *K8SClient) EnvoyForward(namespace, podName, path string) ([]byte, error) {
+	writer := new(bytes.Buffer)
+
+	clientConfig, err := ConfigClient()
+	if err != nil {
+		log.Errorf("Error getting Kubernetes Client config: %v", err)
+		return nil, err
+	}
+
+	// First try whether the pod exist or not
+	_, err = in.GetPod(namespace, podName)
+	if err != nil {
+		log.Errorf("Couldn't fetch the Pod: %v", err)
+		return nil, err
+	}
+
+	// Building the port mapping local:target port
+	envoyLocalPort := config.Get().ExternalServices.Istio.EnvoyAdminLocalPort
+	portMap := fmt.Sprintf("%d:15000", envoyLocalPort)
+
+	// Create a Port Forwarder
+	f, err := config_dump.NewPortForwarder(in.k8s.CoreV1().RESTClient(), clientConfig,
+		namespace, podName, "localhost", portMap, writer)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start the forwarding
+	if err := f.Start(); err != nil {
+		return nil, err
+	}
+
+	// Defering the finish of the port-forwarding
+	defer f.Stop()
+
+	// Ready to create a request
+	resp, code, err := httputil.HttpGet(fmt.Sprintf("http://localhost:%d%s", envoyLocalPort, path), nil, 10*time.Second)
+	if code >= 400 {
+		return resp, fmt.Errorf("error fetching the /config_dump for the Envoy. Response code: %d", code)
+	}
+
+	return resp, err
+}
+
 func (in *K8SClient) hasNetworkingResource(resource string) bool {
 	return in.getNetworkingResources()[resource]
 }
@@ -310,7 +374,7 @@ func (in *K8SClient) getNetworkingResources() map[string]bool {
 
 	networkingResources := map[string]bool{}
 	path := fmt.Sprintf("/apis/%s", ApiNetworkingVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do().Raw()
+	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do(in.ctx).Raw()
 	if err == nil {
 		resourceList := meta_v1.APIResourceList{}
 		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
@@ -324,56 +388,6 @@ func (in *K8SClient) getNetworkingResources() map[string]bool {
 	return *in.networkingResources
 }
 
-func (in *K8SClient) hasConfigResource(resource string) bool {
-	return in.getConfigResources()[resource]
-}
-
-func (in *K8SClient) getConfigResources() map[string]bool {
-	if in.configResources != nil {
-		return *in.configResources
-	}
-
-	configResources := map[string]bool{}
-	path := fmt.Sprintf("/apis/%s", ApiConfigVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do().Raw()
-	if err == nil {
-		resourceList := meta_v1.APIResourceList{}
-		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
-			for _, resource := range resourceList.APIResources {
-				configResources[resource.Name] = true
-			}
-		}
-	}
-	in.configResources = &configResources
-
-	return *in.configResources
-}
-
-func (in *K8SClient) hasRbacResource(resource string) bool {
-	return in.getRbacResources()[resource]
-}
-
-func (in *K8SClient) getRbacResources() map[string]bool {
-	if in.rbacResources != nil {
-		return *in.rbacResources
-	}
-
-	rbacResources := map[string]bool{}
-	path := fmt.Sprintf("/apis/%s", ApiRbacVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do().Raw()
-	if err == nil {
-		resourceList := meta_v1.APIResourceList{}
-		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
-			for _, resource := range resourceList.APIResources {
-				rbacResources[resource.Name] = true
-			}
-		}
-	}
-	in.rbacResources = &rbacResources
-
-	return *in.rbacResources
-}
-
 func (in *K8SClient) hasSecurityResource(resource string) bool {
 	return in.getSecurityResources()[resource]
 }
@@ -385,7 +399,7 @@ func (in *K8SClient) getSecurityResources() map[string]bool {
 
 	securityResources := map[string]bool{}
 	path := fmt.Sprintf("/apis/%s", ApiSecurityVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do().Raw()
+	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do(in.ctx).Raw()
 	if err == nil {
 		resourceList := meta_v1.APIResourceList{}
 		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
@@ -397,31 +411,6 @@ func (in *K8SClient) getSecurityResources() map[string]bool {
 	in.securityResources = &securityResources
 
 	return *in.securityResources
-}
-
-func (in *K8SClient) hasAuthenticationResource(resource string) bool {
-	return in.getAuthenticationResources()[resource]
-}
-
-func (in *K8SClient) getAuthenticationResources() map[string]bool {
-	if in.authenticationResources != nil {
-		return *in.authenticationResources
-	}
-
-	authenticationResources := map[string]bool{}
-	path := fmt.Sprintf("/apis/%s", ApiAuthenticationVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do().Raw()
-	if err == nil {
-		resourceList := meta_v1.APIResourceList{}
-		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
-			for _, resource := range resourceList.APIResources {
-				authenticationResources[resource.Name] = true
-			}
-		}
-	}
-	in.authenticationResources = &authenticationResources
-
-	return *in.authenticationResources
 }
 
 func GetIstioConfigMap(istioConfig *core_v1.ConfigMap) (*IstioMeshConfig, error) {
@@ -448,33 +437,6 @@ func GetIstioConfigMap(istioConfig *core_v1.ConfigMap) (*IstioMeshConfig, error)
 	}
 
 	return meshConfig, nil
-}
-
-func (in *K8SClient) IsMixerDisabled() bool {
-	if in.isMixerDisabled != nil {
-		return *in.isMixerDisabled
-	}
-
-	cfg := config.Get()
-	istioConfig, err := in.GetConfigMap(cfg.IstioNamespace, cfg.ExternalServices.Istio.ConfigMapName)
-	if err != nil {
-		log.Warningf("GetIstioConfigMap: Cannot retrieve Istio ConfigMap.")
-		return false
-	}
-	meshConfig, err := GetIstioConfigMap(istioConfig)
-	if err != nil {
-		log.Warningf("IsMixerDisabled: Cannot read Istio mesh configuration.")
-		return true
-	}
-
-	log.Debugf("IsMixerDisabled: %t", meshConfig.DisableMixerHttpReports)
-
-	// References:
-	//   * https://github.com/istio/api/pull/1112
-	//   * https://github.com/istio/istio/pull/17695
-	//   * https://github.com/istio/istio/issues/15935
-	in.isMixerDisabled = &meshConfig.DisableMixerHttpReports
-	return *in.isMixerDisabled
 }
 
 // ServiceEntryHostnames returns a list of hostnames defined in the ServiceEntries Specs. Key in the resulting map is the protocol (in lowercase) + hostname
@@ -620,7 +582,10 @@ func PeerAuthnHasMTLSEnabled(peerAuthn IstioObject) (bool, string) {
 	if peerAuthn.HasMatchLabelsSelector() {
 		return false, ""
 	}
+	return PeerAuthnMTLSMode(peerAuthn)
+}
 
+func PeerAuthnMTLSMode(peerAuthn IstioObject) (bool, string) {
 	// It is globally enabled when mtls is in STRICT mode
 	if mtls, mtlsPresent := peerAuthn.GetSpec()["mtls"]; mtlsPresent {
 		if mtlsMap, ok := mtls.(map[string]interface{}); ok {
@@ -657,7 +622,10 @@ func DestinationRuleHasMTLSEnabledForHost(expectedHost string, destinationRule I
 	if !hostPresent || host != expectedHost {
 		return false, ""
 	}
+	return DestinationRuleHasMTLSEnabled(destinationRule)
+}
 
+func DestinationRuleHasMTLSEnabled(destinationRule IstioObject) (bool, string) {
 	if trafficPolicy, trafficPresent := destinationRule.GetSpec()["trafficPolicy"]; trafficPresent {
 		if trafficCasted, ok := trafficPolicy.(map[string]interface{}); ok {
 			if tls, found := trafficCasted["tls"]; found {

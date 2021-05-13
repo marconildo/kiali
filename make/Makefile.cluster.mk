@@ -1,6 +1,6 @@
 #
 # Targets for building and pushing images for deployment into a remote cluster.
-# Today this supports minikube and OpenShift4.
+# Today this supports kind, minikube and OpenShift4.
 # If using minikube, you must have the registry addon enabled ("minikube addons enable registry")
 # If using OpenShift, you must expose the image registry externally.
 #
@@ -45,6 +45,17 @@
 		exit 1 ;\
 	 fi
 
+.prepare-kind: .ensure-oc-exists .ensure-kind-exists
+	@$(eval CLUSTER_KIALI_TAG ?= ${CONTAINER_NAME}:${CONTAINER_VERSION})
+	@$(eval CLUSTER_OPERATOR_TAG ?= ${OPERATOR_CONTAINER_NAME}:${OPERATOR_CONTAINER_VERSION})
+ifeq ($(DORP),docker)
+	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= ${CONTAINER_NAME})
+	@$(eval CLUSTER_OPERATOR_INTERNAL_NAME ?= ${OPERATOR_CONTAINER_NAME})
+else
+	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= localhost/${CONTAINER_NAME})
+	@$(eval CLUSTER_OPERATOR_INTERNAL_NAME ?= localhost/${OPERATOR_CONTAINER_NAME})
+endif
+
 .prepare-local: .ensure-oc-exists
 	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= ${CONTAINER_NAME})
 	@$(eval CLUSTER_KIALI_TAG ?= ${CONTAINER_NAME}:${CONTAINER_VERSION})
@@ -53,18 +64,23 @@
 
 ifeq ($(CLUSTER_TYPE),minikube)
 .prepare-cluster: .prepare-minikube
+else ifeq ($(CLUSTER_TYPE),kind)
+.prepare-cluster: .prepare-kind
 else ifeq ($(CLUSTER_TYPE),openshift)
 .prepare-cluster: .prepare-ocp
 else ifeq ($(CLUSTER_TYPE),local)
 .prepare-cluster: .prepare-local
 else
 .prepare-cluster:
-	@echo "ERROR: unknown CLUSTER_TYPE [${CLUSTER_TYPE}] - must be one of: openshift, minikube, local"
+	@echo "ERROR: unknown CLUSTER_TYPE [${CLUSTER_TYPE}] - must be one of: openshift, minikube, kind, local"
 	@exit 1
 endif
 
+.get-cluster-istio-version:
+	@$(eval CLUSTER_ISTIO_VERSION ?= $(shell ${OC} exec $$(${OC} get pods -n ${ISTIO_NAMESPACE} -l app=istiod -o name 2>/dev/null) -n ${ISTIO_NAMESPACE} -- curl -s http://localhost:15014/version 2>/dev/null | grep . || echo "N/A"))
+
 ## cluster-status: Outputs details of the client and server for the cluster
-cluster-status: .prepare-cluster
+cluster-status: .prepare-cluster .get-cluster-istio-version
 	@echo "================================================================="
 	@echo "CLUSTER DETAILS"
 	@echo "================================================================="
@@ -87,6 +103,8 @@ else ifeq ($(CLUSTER_TYPE),minikube)
 	@echo "Console URL: Run 'minikube dashboard' to access the UI console"
 	@echo "================================================================="
 endif
+	@echo "Istio Version (if installed): ${CLUSTER_ISTIO_VERSION}"
+	@echo "================================================================="
 	@echo "Kiali image as seen from inside the cluster:       ${CLUSTER_KIALI_INTERNAL_NAME}"
 	@echo "Kiali image that will be pushed to the cluster:    ${CLUSTER_KIALI_TAG}"
 	@echo "Operator image as seen from inside the cluster:    ${CLUSTER_OPERATOR_INTERNAL_NAME}"
@@ -158,8 +176,13 @@ endif
 
 ## cluster-build-operator: Builds the operator image for development with a remote cluster
 cluster-build-operator: .ensure-operator-repo-exists .prepare-cluster container-build-operator
-	@echo Building container image for Kiali operator using operator-sdk tagged for a remote cluster
-	cd "${ROOTDIR}/operator" && "${OP_SDK}" build --image-builder ${DORP} --image-build-args "--pull" "${CLUSTER_OPERATOR_TAG}"
+ifeq ($(DORP),docker)
+	@echo Re-tag the already built Kiali operator container image for a remote cluster using docker
+	docker tag ${OPERATOR_QUAY_TAG} ${CLUSTER_OPERATOR_TAG}
+else
+	@echo Re-tag the already built Kiali operator container image for a remote cluster using podman
+	podman tag ${OPERATOR_QUAY_TAG} ${CLUSTER_OPERATOR_TAG}
+endif
 
 ## cluster-build-kiali: Builds the Kiali image for development with a remote cluster
 cluster-build-kiali: .prepare-cluster container-build-kiali
@@ -176,6 +199,17 @@ cluster-build: cluster-build-operator cluster-build-kiali
 
 ## cluster-push-operator: Pushes Kiali operator container image to a remote cluster
 cluster-push-operator: cluster-build-operator
+ifeq ($(CLUSTER_TYPE),kind)
+ifeq ($(DORP),docker)
+	@echo Pushing Kiali operator image via docker to kind cluster: ${CLUSTER_OPERATOR_TAG}
+	${KIND} load docker-image --name ${KIND_NAME} ${CLUSTER_OPERATOR_TAG}
+else
+	@echo Pushing Kiali operator image via podman to kind cluster: ${CLUSTER_OPERATOR_TAG}
+	@rm -f /tmp/kiali-cluster-push-operator.tar
+	podman save -o /tmp/kiali-cluster-push-operator.tar ${CLUSTER_OPERATOR_TAG}
+	${KIND} load image-archive /tmp/kiali-cluster-push-operator.tar --name ${KIND_NAME}
+endif
+else
 ifeq ($(DORP),docker)
 	@echo Pushing Kiali operator image to remote cluster using docker: ${CLUSTER_OPERATOR_TAG}
 	docker push ${CLUSTER_OPERATOR_TAG}
@@ -183,15 +217,28 @@ else
 	@echo Pushing Kiali operator image to remote cluster using podman: ${CLUSTER_OPERATOR_TAG}
 	podman push --tls-verify=false ${CLUSTER_OPERATOR_TAG}
 endif
+endif
 
 ## cluster-push-kiali: Pushes Kiali image to a remote cluster
 cluster-push-kiali: cluster-build-kiali
+ifeq ($(CLUSTER_TYPE),kind)
+ifeq ($(DORP),docker)
+	@echo Pushing Kiali image via docker to kind cluster: ${CLUSTER_KIALI_TAG}
+	${KIND} load docker-image --name ${KIND_NAME} ${CLUSTER_KIALI_TAG}
+else
+	@echo Pushing Kiali image via podman to kind cluster: ${CLUSTER_KIALI_TAG}
+	@rm -f /tmp/kiali-cluster-push-kiali.tar
+	podman save -o /tmp/kiali-cluster-push-kiali.tar ${CLUSTER_KIALI_TAG}
+	${KIND} load image-archive /tmp/kiali-cluster-push-kiali.tar --name ${KIND_NAME}
+endif
+else
 ifeq ($(DORP),docker)
 	@echo Pushing Kiali image to remote cluster using docker: ${CLUSTER_KIALI_TAG}
 	docker push ${CLUSTER_KIALI_TAG}
 else
 	@echo Pushing Kiali image to remote cluster using podman: ${CLUSTER_KIALI_TAG}
 	podman push --tls-verify=false ${CLUSTER_KIALI_TAG}
+endif
 endif
 
 ## cluster-push: Pushes container images to a remote cluster

@@ -3,7 +3,6 @@ package models
 import (
 	"strconv"
 
-	kmodel "github.com/kiali/k-charted/model"
 	osapps_v1 "github.com/openshift/api/apps/v1"
 	apps_v1 "k8s.io/api/apps/v1"
 	batch_v1 "k8s.io/api/batch/v1"
@@ -79,6 +78,10 @@ type WorkloadListItem struct {
 	// required: true
 	// example: 1
 	PodCount int `json:"podCount"`
+
+	// HealthAnnotations
+	// required: false
+	HealthAnnotations map[string]string `json:"healthAnnotations"`
 }
 
 type WorkloadOverviews []*WorkloadListItem
@@ -109,7 +112,7 @@ type Workload struct {
 	Services Services `json:"services"`
 
 	// Runtimes and associated dashboards
-	Runtimes []kmodel.Runtime `json:"runtimes"`
+	Runtimes []Runtime `json:"runtimes"`
 
 	// Additional details to display, such as configured annotations
 	AdditionalDetails []AdditionalItem `json:"additionalDetails"`
@@ -127,6 +130,7 @@ func (workload *WorkloadListItem) ParseWorkload(w *Workload) {
 	workload.Labels = w.Labels
 	workload.PodCount = len(w.Pods)
 	workload.AdditionalDetailSample = w.AdditionalDetailSample
+	workload.HealthAnnotations = w.HealthAnnotations
 
 	/** Check the labels app and version required by Istio in template Pods*/
 	_, workload.AppLabel = w.Labels[conf.IstioLabels.AppLabelName]
@@ -168,6 +172,7 @@ func (workload *Workload) ParseDeployment(d *apps_v1.Deployment) {
 	}
 	workload.CurrentReplicas = d.Status.Replicas
 	workload.AvailableReplicas = d.Status.AvailableReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(d.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParseReplicaSet(r *apps_v1.ReplicaSet) {
@@ -180,6 +185,21 @@ func (workload *Workload) ParseReplicaSet(r *apps_v1.ReplicaSet) {
 	workload.AvailableReplicas = r.Status.AvailableReplicas
 }
 
+func (workload *Workload) ParseReplicaSetParent(r *apps_v1.ReplicaSet, workloadName string, workloadType string) {
+	// Some properties are taken from the ReplicaSet
+	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta)
+	// But name and type are coming from the parent
+	// Custom properties from parent controller are not processed by Kiali
+	workload.Type = workloadType
+	workload.Name = workloadName
+	if r.Spec.Replicas != nil {
+		workload.DesiredReplicas = *r.Spec.Replicas
+	}
+	workload.CurrentReplicas = r.Status.Replicas
+	workload.AvailableReplicas = r.Status.AvailableReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(r.Annotations, GetHealthConfigAnnotation())
+}
+
 func (workload *Workload) ParseReplicationController(r *core_v1.ReplicationController) {
 	workload.Type = "ReplicationController"
 	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta)
@@ -188,6 +208,7 @@ func (workload *Workload) ParseReplicationController(r *core_v1.ReplicationContr
 	}
 	workload.CurrentReplicas = r.Status.Replicas
 	workload.AvailableReplicas = r.Status.AvailableReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(r.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParseDeploymentConfig(dc *osapps_v1.DeploymentConfig) {
@@ -196,6 +217,7 @@ func (workload *Workload) ParseDeploymentConfig(dc *osapps_v1.DeploymentConfig) 
 	workload.DesiredReplicas = dc.Spec.Replicas
 	workload.CurrentReplicas = dc.Status.Replicas
 	workload.AvailableReplicas = dc.Status.AvailableReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(dc.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParseStatefulSet(s *apps_v1.StatefulSet) {
@@ -206,6 +228,7 @@ func (workload *Workload) ParseStatefulSet(s *apps_v1.StatefulSet) {
 	}
 	workload.CurrentReplicas = s.Status.Replicas
 	workload.AvailableReplicas = s.Status.ReadyReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(s.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParsePod(pod *core_v1.Pod) {
@@ -230,6 +253,7 @@ func (workload *Workload) ParsePod(pod *core_v1.Pod) {
 	// Pod has not concept of replica
 	workload.CurrentReplicas = workload.DesiredReplicas
 	workload.AvailableReplicas = podAvailableReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(pod.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParseJob(job *batch_v1.Job) {
@@ -240,6 +264,7 @@ func (workload *Workload) ParseJob(job *batch_v1.Job) {
 	workload.DesiredReplicas = job.Status.Active + job.Status.Succeeded + job.Status.Failed
 	workload.CurrentReplicas = workload.DesiredReplicas
 	workload.AvailableReplicas = job.Status.Active + job.Status.Succeeded
+	workload.HealthAnnotations = GetHealthAnnotation(job.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParseCronJob(cnjb *batch_v1beta1.CronJob) {
@@ -264,6 +289,19 @@ func (workload *Workload) ParseCronJob(cnjb *batch_v1beta1.CronJob) {
 	workload.DesiredReplicas = podReplicas
 	workload.DesiredReplicas = workload.CurrentReplicas
 	workload.AvailableReplicas = podAvailableReplicas
+	workload.HealthAnnotations = GetHealthAnnotation(cnjb.Annotations, GetHealthConfigAnnotation())
+}
+
+func (workload *Workload) ParseDaemonSet(ds *apps_v1.DaemonSet) {
+	workload.Type = "DaemonSet"
+	workload.parseObjectMeta(&ds.ObjectMeta, &ds.Spec.Template.ObjectMeta)
+	// This is a cornercase for DaemonSet controllers
+	// Desired is the number of desired nodes in a cluster that are running a DaemonSet Pod
+	// We are not going to change that terminology in the backend model yet, but probably add a note in the UI in the future
+	workload.DesiredReplicas = ds.Status.DesiredNumberScheduled
+	workload.CurrentReplicas = ds.Status.CurrentNumberScheduled
+	workload.AvailableReplicas = ds.Status.NumberAvailable
+	workload.HealthAnnotations = GetHealthAnnotation(ds.Annotations, GetHealthConfigAnnotation())
 }
 
 func (workload *Workload) ParsePods(controllerName string, controllerType string, pods []core_v1.Pod) {
@@ -290,8 +328,8 @@ func (workload *Workload) ParsePods(controllerName string, controllerType string
 	workload.AvailableReplicas = podAvailableReplicas
 	// We fetch one pod as template for labels
 	// There could be corner cases not correct, then we should support more controllers
+	workload.Labels = map[string]string{}
 	if len(pods) > 0 {
-		workload.Labels = map[string]string{}
 		if pods[0].Labels != nil {
 			workload.Labels = pods[0].Labels
 		}

@@ -1,7 +1,6 @@
 package appender
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -14,133 +13,223 @@ import (
 func TestResponseTime(t *testing.T) {
 	assert := assert.New(t)
 
-	// note - Istio is migrating their latency metric from seconds to milliseconds. We need to support both until
-	//        the 'seconds' variant is removed. That is why we have these complex queries with OR logic.
-	q0Temp := `histogram_quantile(0.95, sum(rate(istio_request_duration_%s_bucket{reporter="destination",source_workload="unknown",destination_workload_namespace="bookinfo"}[60s])) by (le,source_workload_namespace,source_workload,source_app,source_version,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_app,destination_version,response_code,grpc_response_status))`
-	q0 := fmt.Sprintf(`round(((%s > 0) OR ((%s > 0) * 1000.0)),0.001)`, fmt.Sprintf(q0Temp, "milliseconds"), fmt.Sprintf(q0Temp, "seconds"))
-	v0 := model.Vector{}
-
-	q1Temp := `histogram_quantile(0.95, sum(rate(istio_request_duration_%s_bucket{reporter="source",source_workload_namespace!="bookinfo",source_workload!="unknown",destination_service_namespace="bookinfo"}[60s])) by (le,source_workload_namespace,source_workload,source_app,source_version,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_app,destination_version,response_code,grpc_response_status))`
-	q1 := fmt.Sprintf(`round(((%s > 0) OR ((%s > 0) * 1000.0)),0.001)`, fmt.Sprintf(q1Temp, "milliseconds"), fmt.Sprintf(q1Temp, "seconds"))
-	q1m0 := model.Metric{
+	q0 := `round(histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{reporter="destination",destination_service_namespace="bookinfo"}[60s])) by (le,source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_code,grpc_response_status)) > 0,0.001)`
+	q0m0 := model.Metric{
 		"source_workload_namespace":      "istio-system",
 		"source_workload":                "ingressgateway-unknown",
-		"source_app":                     "ingressgateway",
-		"source_version":                 model.LabelValue(graph.Unknown),
+		"source_canonical_service":       "ingressgateway",
+		"source_canonical_revision":      model.LabelValue(graph.Unknown),
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "productpage.bookinfo.svc.cluster.local",
 		"destination_service_name":       "productpage",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "productpage-v1",
-		"destination_app":                "productpage",
-		"destination_version":            "v1",
+		"destination_canonical_service":  "productpage",
+		"destination_canonical_revision": "v1",
 		"response_code":                  "200"}
-	v1 := model.Vector{
-		&model.Sample{
-			Metric: q1m0,
-			Value:  0.010}}
-
-	q2Temp := `histogram_quantile(0.95, sum(rate(istio_request_duration_%s_bucket{reporter="source",source_workload_namespace="bookinfo"}[60s])) by (le,source_workload_namespace,source_workload,source_app,source_version,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_app,destination_version,response_code,grpc_response_status))`
-	q2 := fmt.Sprintf(`round(((%s > 0) OR ((%s > 0) * 1000.0)),0.001)`, fmt.Sprintf(q2Temp, "milliseconds"), fmt.Sprintf(q2Temp, "seconds"))
-	q2m0 := model.Metric{
+	q0m1 := model.Metric{
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
-		"source_app":                     "productpage",
-		"source_version":                 "v1",
+		"source_canonical_service":       "productpage",
+		"source_canonical_revision":      "v1",
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "reviews-v1",
-		"destination_app":                "reviews",
-		"destination_version":            "v1",
+		"destination_canonical_service":  "reviews",
+		"destination_canonical_revision": "v1",
 		"response_code":                  "200"}
-	q2m1 := model.Metric{
+	q0m2 := model.Metric{
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
-		"source_app":                     "productpage",
-		"source_version":                 "v1",
+		"source_canonical_service":       "productpage",
+		"source_canonical_revision":      "v1",
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "reviews-v2",
-		"destination_app":                "reviews",
-		"destination_version":            "v2",
+		"destination_canonical_service":  "reviews",
+		"destination_canonical_revision": "v2",
 		"response_code":                  "200"}
-	q2m2 := model.Metric{
+	q0m3 := model.Metric{
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "reviews-v1",
-		"source_app":                     "reviews",
-		"source_version":                 "v1",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v1",
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "ratings.bookinfo.svc.cluster.local",
 		"destination_service_name":       "ratings",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "ratings-v1",
-		"destination_app":                "ratings",
-		"destination_version":            "v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
 		"response_code":                  "200"}
-	q2m3 := model.Metric{
+	q0m4 := model.Metric{
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "reviews-v2",
-		"source_app":                     "reviews",
-		"source_version":                 "v2",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v2",
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "ratings.bookinfo.svc.cluster.local",
 		"destination_service_name":       "ratings",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "ratings-v1",
-		"destination_app":                "ratings",
-		"destination_version":            "v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
 		"response_code":                  "200"}
-	q2m4 := model.Metric{
+	q0m5 := model.Metric{
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "reviews-v2",
-		"source_app":                     "reviews",
-		"source_version":                 "v2",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v2",
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "ratings.bookinfo.svc.cluster.local",
 		"destination_service_name":       "ratings",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "ratings-v1",
-		"destination_app":                "ratings",
-		"destination_version":            "v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
 		"response_code":                  "404", // should get tossed out on HTTP error
 		"grpc_response_status":           "0"}
-	q2m5 := model.Metric{
+	q0m6 := model.Metric{
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "reviews-v2",
-		"source_app":                     "reviews",
-		"source_version":                 "v2",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v2",
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "ratings.bookinfo.svc.cluster.local",
 		"destination_service_name":       "ratings",
 		"destination_workload_namespace": "bookinfo",
 		"destination_workload":           "ratings-v1",
-		"destination_app":                "ratings",
-		"destination_version":            "v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
 		"response_code":                  "200",
 		"grpc_response_status":           "1"} // should get tossed out on GRPC error
-
-	v2 := model.Vector{
+	v0 := model.Vector{
 		&model.Sample{
-			Metric: q2m0,
+			Metric: q0m0,
+			Value:  0.010},
+		&model.Sample{
+			Metric: q0m1,
 			Value:  0.020},
 		&model.Sample{
-			Metric: q2m1,
+			Metric: q0m2,
 			Value:  0.020},
 		&model.Sample{
-			Metric: q2m2,
-			Value:  0.030},
+			Metric: q0m3,
+			Value:  0.030}, // same edge reported by outgoing (q1), this > value should be preferred
 		&model.Sample{
-			Metric: q2m3,
-			Value:  0.030},
+			Metric: q0m4,
+			Value:  0.030}, // same edge reported by outgoing (q1), this > value should be preferred
 		&model.Sample{
-			Metric: q2m4,
+			Metric: q0m5,
 			Value:  0.001},
 		&model.Sample{
-			Metric: q2m5,
+			Metric: q0m6,
+			Value:  0.001},
+	}
+
+	q1 := `round(histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{reporter="source",source_workload_namespace="bookinfo"}[60s])) by (le,source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_code,grpc_response_status)) > 0,0.001)`
+	q1m0 := model.Metric{
+		"source_workload_namespace":      "bookinfo",
+		"source_workload":                "productpage-v1",
+		"source_canonical_service":       "productpage",
+		"source_canonical_revision":      "v1",
+		"destination_service_namespace":  "bookinfo",
+		"destination_service":            "reviews.bookinfo.svc.cluster.local",
+		"destination_service_name":       "reviews",
+		"destination_workload_namespace": "bookinfo",
+		"destination_workload":           "reviews-v1",
+		"destination_canonical_service":  "reviews",
+		"destination_canonical_revision": "v1",
+		"response_code":                  "200"}
+	q1m1 := model.Metric{
+		"source_workload_namespace":      "bookinfo",
+		"source_workload":                "productpage-v1",
+		"source_canonical_service":       "productpage",
+		"source_canonical_revision":      "v1",
+		"destination_service_namespace":  "bookinfo",
+		"destination_service":            "reviews.bookinfo.svc.cluster.local",
+		"destination_service_name":       "reviews",
+		"destination_workload_namespace": "bookinfo",
+		"destination_workload":           "reviews-v2",
+		"destination_canonical_service":  "reviews",
+		"destination_canonical_revision": "v2",
+		"response_code":                  "200"}
+	q1m2 := model.Metric{
+		"source_workload_namespace":      "bookinfo",
+		"source_workload":                "reviews-v1",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v1",
+		"destination_service_namespace":  "bookinfo",
+		"destination_service":            "ratings.bookinfo.svc.cluster.local",
+		"destination_service_name":       "ratings",
+		"destination_workload_namespace": "bookinfo",
+		"destination_workload":           "ratings-v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
+		"response_code":                  "200"}
+	q1m3 := model.Metric{
+		"source_workload_namespace":      "bookinfo",
+		"source_workload":                "reviews-v2",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v2",
+		"destination_service_namespace":  "bookinfo",
+		"destination_service":            "ratings.bookinfo.svc.cluster.local",
+		"destination_service_name":       "ratings",
+		"destination_workload_namespace": "bookinfo",
+		"destination_workload":           "ratings-v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
+		"response_code":                  "200"}
+	q1m4 := model.Metric{
+		"source_workload_namespace":      "bookinfo",
+		"source_workload":                "reviews-v2",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v2",
+		"destination_service_namespace":  "bookinfo",
+		"destination_service":            "ratings.bookinfo.svc.cluster.local",
+		"destination_service_name":       "ratings",
+		"destination_workload_namespace": "bookinfo",
+		"destination_workload":           "ratings-v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
+		"response_code":                  "404", // should get tossed out on HTTP error
+		"grpc_response_status":           "0"}
+	q1m5 := model.Metric{
+		"source_workload_namespace":      "bookinfo",
+		"source_workload":                "reviews-v2",
+		"source_canonical_service":       "reviews",
+		"source_canonical_revision":      "v2",
+		"destination_service_namespace":  "bookinfo",
+		"destination_service":            "ratings.bookinfo.svc.cluster.local",
+		"destination_service_name":       "ratings",
+		"destination_workload_namespace": "bookinfo",
+		"destination_workload":           "ratings-v1",
+		"destination_canonical_service":  "ratings",
+		"destination_canonical_revision": "v1",
+		"response_code":                  "200",
+		"grpc_response_status":           "1"} // should get tossed out on GRPC error
+	v1 := model.Vector{
+		&model.Sample{
+			Metric: q1m0,
+			Value:  0.020},
+		&model.Sample{
+			Metric: q1m1,
+			Value:  0.020},
+		&model.Sample{
+			Metric: q1m2,
+			Value:  0.040}, // same edge reported by incoming (q0), this > value should get ignored
+		&model.Sample{
+			Metric: q1m3,
+			Value:  0.040}, // same edge reported by incoming (q0), this > value should get ignored
+		&model.Sample{
+			Metric: q1m4,
+			Value:  0.001},
+		&model.Sample{
+			Metric: q1m5,
 			Value:  0.001}}
 
 	client, api, err := setupMocked()
@@ -150,10 +239,9 @@ func TestResponseTime(t *testing.T) {
 	}
 	mockQuery(api, q0, &v0)
 	mockQuery(api, q1, &v1)
-	mockQuery(api, q2, &v2)
 
 	trafficMap := responseTimeTestTraffic()
-	ingressID, _ := graph.Id("istio-system", "", "istio-system", "ingressgateway-unknown", "ingressgateway", graph.Unknown, graph.GraphTypeVersionedApp)
+	ingressID, _ := graph.Id(graph.Unknown, "istio-system", "", "istio-system", "ingressgateway-unknown", "ingressgateway", graph.Unknown, graph.GraphTypeVersionedApp)
 	ingress, ok := trafficMap[ingressID]
 	assert.Equal(true, ok)
 	assert.Equal("ingressgateway", ingress.App)
@@ -239,15 +327,16 @@ func TestResponseTime(t *testing.T) {
 }
 
 func responseTimeTestTraffic() graph.TrafficMap {
-	ingress := graph.NewNode("istio-system", "", "istio-system", "ingressgateway-unknown", "ingressgateway", graph.Unknown, graph.GraphTypeVersionedApp)
-	productpageService := graph.NewNode("bookinfo", "productpage", "", "", "", "", graph.GraphTypeVersionedApp)
-	productpage := graph.NewNode("bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
-	reviewsService := graph.NewNode("bookinfo", "reviews", "", "", "", "", graph.GraphTypeVersionedApp)
-	reviewsV1 := graph.NewNode("bookinfo", "reviews", "bookinfo", "reviews-v1", "reviews", "v1", graph.GraphTypeVersionedApp)
-	reviewsV2 := graph.NewNode("bookinfo", "reviews", "bookinfo", "reviews-v2", "reviews", "v2", graph.GraphTypeVersionedApp)
-	ratingsService := graph.NewNode("bookinfo", "ratings", "", "", "", "", graph.GraphTypeVersionedApp)
-	ratings := graph.NewNode("bookinfo", "ratings", "bookinfo", "ratings-v1", "ratings", "v1", graph.GraphTypeVersionedApp)
+	ingress := graph.NewNode(graph.Unknown, "istio-system", "", "istio-system", "ingressgateway-unknown", "ingressgateway", graph.Unknown, graph.GraphTypeVersionedApp)
+	productpageService := graph.NewNode(graph.Unknown, "bookinfo", "productpage", "", "", "", "", graph.GraphTypeVersionedApp)
+	productpage := graph.NewNode(graph.Unknown, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	reviewsService := graph.NewNode(graph.Unknown, "bookinfo", "reviews", "", "", "", "", graph.GraphTypeVersionedApp)
+	reviewsV1 := graph.NewNode(graph.Unknown, "bookinfo", "reviews", "bookinfo", "reviews-v1", "reviews", "v1", graph.GraphTypeVersionedApp)
+	reviewsV2 := graph.NewNode(graph.Unknown, "bookinfo", "reviews", "bookinfo", "reviews-v2", "reviews", "v2", graph.GraphTypeVersionedApp)
+	ratingsService := graph.NewNode(graph.Unknown, "bookinfo", "ratings", "", "", "", "", graph.GraphTypeVersionedApp)
+	ratings := graph.NewNode(graph.Unknown, "bookinfo", "ratings", "bookinfo", "ratings-v1", "ratings", "v1", graph.GraphTypeVersionedApp)
 	trafficMap := graph.NewTrafficMap()
+
 	trafficMap[ingress.ID] = &ingress
 	trafficMap[productpageService.ID] = &productpageService
 	trafficMap[productpage.ID] = &productpage

@@ -13,7 +13,9 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
@@ -67,7 +69,7 @@ func setupNamespaceHealthEndpoint(t *testing.T) (*httptest.Server, *kubetest.K8S
 
 	mr.HandleFunc("/api/namespaces/{namespace}/health", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "token", "test")
+			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
 			NamespaceHealth(w, r.WithContext(context))
 		}))
 
@@ -118,7 +120,7 @@ func setupAppHealthEndpoint(t *testing.T) (*httptest.Server, *kubetest.K8SClient
 
 	mr.HandleFunc("/api/namespaces/{namespace}/apps/{app}/health", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "token", "test")
+			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
 			AppHealth(w, r.WithContext(context))
 		}))
 
@@ -157,12 +159,12 @@ func setupServiceHealthEndpoint(t *testing.T) (*httptest.Server, *kubetest.K8SCl
 	business.SetWithBackends(mockClientFactory, prom)
 
 	setupMockData(k8s)
-
+	k8s.On("GetService", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&core_v1.Service{}, nil)
 	mr := mux.NewRouter()
 
 	mr.HandleFunc("/api/namespaces/{namespace}/services/{service}/health", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "token", "test")
+			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
 			ServiceHealth(w, r.WithContext(context))
 		}))
 

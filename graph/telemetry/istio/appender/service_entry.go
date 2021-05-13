@@ -53,34 +53,16 @@ func (a ServiceEntryAppender) AppendGraph(trafficMap graph.TrafficMap, globalInf
 		return
 	}
 
-	a.applyServiceEntries(trafficMap, globalInfo, namespaceInfo)
-}
+	if globalInfo.HomeCluster == "" {
+		globalInfo.HomeCluster = "unknown"
+		c, err := globalInfo.Business.Mesh.ResolveKialiControlPlaneCluster(nil)
+		graph.CheckError(err)
+		if c != nil {
+			globalInfo.HomeCluster = c.Name
+		}
+	}
 
-// aggregateEdges identifies edges that are going from <node> to <serviceEntryNode> and
-// aggregates them in only one edge per protocol. This ensures that the traffic map
-// will comply with the assumption/rule of one edge per protocol between any two nodes.
-func aggregateEdges(node *graph.Node, serviceEntryNode *graph.Node) {
-	edgesToAggregate := make(map[string][]*graph.Edge)
-	bound := 0
-	for _, edge := range node.Edges {
-		if edge.Dest == serviceEntryNode {
-			protocol := edge.Metadata[graph.ProtocolKey].(string)
-			edgesToAggregate[protocol] = append(edgesToAggregate[protocol], edge)
-		} else {
-			// Manipulating the slice as in this StackOverflow post: https://stackoverflow.com/a/20551116
-			node.Edges[bound] = edge
-			bound++
-		}
-	}
-	node.Edges = node.Edges[:bound]
-	// Add aggregated edge
-	for protocol, edges := range edgesToAggregate {
-		aggregatedEdge := node.AddEdge(serviceEntryNode)
-		aggregatedEdge.Metadata[graph.ProtocolKey] = protocol
-		for _, e := range edges {
-			graph.AggregateEdgeTraffic(e, aggregatedEdge)
-		}
-	}
+	a.applyServiceEntries(trafficMap, globalInfo, namespaceInfo)
 }
 
 func (a ServiceEntryAppender) applyServiceEntries(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
@@ -103,9 +85,11 @@ func (a ServiceEntryAppender) applyServiceEntries(trafficMap graph.TrafficMap, g
 			continue
 		}
 
-		// A service node represents a serviceEntry when the service name matches serviceEntry host. Map
-		// these "se-service" nodes to the serviceEntries that represent them.
-		if se, ok := a.getServiceEntry(n.Service, globalInfo); ok {
+		// To match, a service entry must be exported to the source namespace, and the requested
+		// service must match a defined host.  Note that teh source namespace is assumed to be the
+		// the same as the appender namespace as all requests for the service entry should be coming
+		// from workloads in the current namespace being processed for the graph.
+		if se, ok := a.getServiceEntry(namespaceInfo.Namespace, n.Service, globalInfo); ok {
 			if nodes, ok := seMap[se]; ok {
 				seMap[se] = append(nodes, n)
 			} else {
@@ -116,8 +100,11 @@ func (a ServiceEntryAppender) applyServiceEntries(trafficMap graph.TrafficMap, g
 
 	// Replace "se-service" nodes with an "se-aggregate" serviceEntry node
 	for se, seServiceNodes := range seMap {
-		serviceEntryNode := graph.NewNode(namespaceInfo.Namespace, se.name, "", "", "", "", a.GraphType)
-		serviceEntryNode.Metadata[graph.IsServiceEntry] = se.location
+		serviceEntryNode := graph.NewNode(globalInfo.HomeCluster, namespaceInfo.Namespace, se.name, "", "", "", "", a.GraphType)
+		serviceEntryNode.Metadata[graph.IsServiceEntry] = &graph.SEInfo{
+			Location: se.location,
+			Hosts:    se.hosts,
+		}
 		serviceEntryNode.Metadata[graph.DestServices] = graph.NewDestServicesMetadata()
 		for _, doomedSeServiceNode := range seServiceNodes {
 			// aggregate node traffic
@@ -165,10 +152,10 @@ func (a ServiceEntryAppender) applyServiceEntries(trafficMap graph.TrafficMap, g
 
 // getServiceEntry queries the cluster API to resolve service entries across all accessible namespaces
 // in the cluster.
-// TODO: I don't know what happens (nothing good) if a ServiceEntry is defined in an inaccessible namespace but exported to
-// all namespaces (exportTo: *). It's possible that would allow traffic to flow from an accessible workload
-// through a serviceEntry whose definition we can't fetch.
-func (a ServiceEntryAppender) getServiceEntry(serviceName string, globalInfo *graph.AppenderGlobalInfo) (*serviceEntry, bool) {
+// TODO: I don't know what happens (nothing good) if a ServiceEntry is defined in an inaccessible namespace
+// but exported to all namespaces (exportTo: *). It's possible that would allow traffic to flow from an
+// accessible workload through a serviceEntry whose definition we can't fetch.
+func (a ServiceEntryAppender) getServiceEntry(namespace, serviceName string, globalInfo *graph.AppenderGlobalInfo) (*serviceEntry, bool) {
 	serviceEntryHosts, found := getServiceEntryHosts(globalInfo)
 	if !found {
 		for ns := range a.AccessibleNamespaces {
@@ -185,8 +172,10 @@ func (a ServiceEntryAppender) getServiceEntry(serviceName string, globalInfo *gr
 						location = "MESH_INTERNAL"
 					}
 					se := serviceEntry{
-						location: location,
-						name:     entry.Metadata.Name,
+						exportTo:  entry.Spec.ExportTo,
+						location:  location,
+						name:      entry.Metadata.Name,
+						namespace: entry.Metadata.Namespace,
 					}
 					for _, host := range entry.Spec.Hosts.([]interface{}) {
 						serviceEntryHosts.addHost(host.(string), &se)
@@ -197,31 +186,83 @@ func (a ServiceEntryAppender) getServiceEntry(serviceName string, globalInfo *gr
 		globalInfo.Vendor[serviceEntryHostsKey] = serviceEntryHosts
 	}
 
-	for host, se := range serviceEntryHosts {
-		// handle exact match
-		// note: this also handles wildcard-prefix cases because the destination_service_name set by istio
-		// is the matching host (e.g. *.wikipedia.com), not the rested service (e.g. de.wikipedia.com)
-		if host == serviceName {
-			return se, true
-		}
-		// handle serviceName prefix (e.g. host = serviceName.namespace.svc.cluster.local)
-		if se.location == "MESH_INTERNAL" {
-			hostSplitted := strings.Split(host, ".")
-
-			if len(hostSplitted) == 3 && hostSplitted[2] == config.IstioMultiClusterHostSuffix {
-				// If suffix is "global", this node should be a service entry
-				// related to multi-cluster configs. Only exact match should be done, so
-				// skip prefix matching.
-				//
-				// Number of entries == 3 in the host is checked because the host
-				// must be of the form svc.namespace.global for Istio to
-				// work correctly in the multi-cluster/multiple-control-plane scenario.
+	for host, serviceEntriesForHost := range serviceEntryHosts {
+		for _, se := range serviceEntriesForHost {
+			if !isExportedToNamespace(se, namespace) {
 				continue
-			} else if hostSplitted[0] == serviceName {
+			}
+
+			// handle exact match
+			// note: this also handles wildcard-prefix cases because the destination_service_name set by istio
+			// is the matching host (e.g. *.wikipedia.com), not the rested service (e.g. de.wikipedia.com)
+			if host == serviceName {
 				return se, true
+			}
+			// handle serviceName prefix (e.g. host = serviceName.namespace.svc.cluster.local)
+			if se.location == "MESH_INTERNAL" {
+				hostSplitted := strings.Split(host, ".")
+
+				if len(hostSplitted) == 3 && hostSplitted[2] == config.IstioMultiClusterHostSuffix {
+					// If suffix is "global", this node should be a service entry
+					// related to multi-cluster configs. Only exact match should be done, so
+					// skip prefix matching.
+					//
+					// Number of entries == 3 in the host is checked because the host
+					// must be of the form svc.namespace.global for Istio to
+					// work correctly in the multi-cluster/multiple-control-plane scenario.
+					continue
+				} else if hostSplitted[0] == serviceName {
+					return se, true
+				}
 			}
 		}
 	}
 
 	return nil, false
+}
+
+func isExportedToNamespace(se *serviceEntry, namespace string) bool {
+	if se.exportTo == nil {
+		return true
+	}
+	for _, export := range se.exportTo.([]interface{}) {
+		if export == "*" {
+			return true
+		}
+		if export == "." && se.namespace == namespace {
+			return true
+		}
+		if export == se.namespace {
+			return true
+		}
+	}
+
+	return false
+}
+
+// aggregateEdges identifies edges that are going from <node> to <serviceEntryNode> and
+// aggregates them in only one edge per protocol. This ensures that the traffic map
+// will comply with the assumption/rule of one edge per protocol between any two nodes.
+func aggregateEdges(node *graph.Node, serviceEntryNode *graph.Node) {
+	edgesToAggregate := make(map[string][]*graph.Edge)
+	bound := 0
+	for _, edge := range node.Edges {
+		if edge.Dest == serviceEntryNode {
+			protocol := edge.Metadata[graph.ProtocolKey].(string)
+			edgesToAggregate[protocol] = append(edgesToAggregate[protocol], edge)
+		} else {
+			// Manipulating the slice as in this StackOverflow post: https://stackoverflow.com/a/20551116
+			node.Edges[bound] = edge
+			bound++
+		}
+	}
+	node.Edges = node.Edges[:bound]
+	// Add aggregated edge
+	for protocol, edges := range edgesToAggregate {
+		aggregatedEdge := node.AddEdge(serviceEntryNode)
+		aggregatedEdge.Metadata[graph.ProtocolKey] = protocol
+		for _, e := range edges {
+			graph.AggregateEdgeTraffic(e, aggregatedEdge)
+		}
+	}
 }

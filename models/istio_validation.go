@@ -92,7 +92,6 @@ var ObjectTypeSingular = map[string]string{
 	"rules":                  "rule",
 	"quotaspecs":             "quotaspec",
 	"quotaspecbindings":      "quotaspecbinding",
-	"servicemeshpolicies":    "servicemeshpolicy",
 	"policies":               "policy",
 	"serviceroles":           "servicerole",
 	"servicerolebindings":    "servicerolebinding",
@@ -151,6 +150,10 @@ var checkDescriptors = map[string]IstioCheck{
 	"destinationrules.mtls.meshpolicymtlsenabled": {
 		Message:  "KIA0208 PeerAuthentication enabling mTLS found, permissive mode needed",
 		Severity: ErrorSeverity,
+	},
+	"destinationrules.nodest.subsetnolabels": {
+		Message:  "KIA0209 This subset has not labels",
+		Severity: WarningSeverity,
 	},
 	"gateways.multimatch": {
 		Message:  "KIA0301 More than one Gateway for the same host port combination",

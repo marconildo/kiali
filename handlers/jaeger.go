@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -226,24 +227,46 @@ func WorkloadSpans(w http.ResponseWriter, r *http.Request) {
 }
 
 func readQuery(values url.Values) (models.TracingQuery, error) {
-	startMicros := values.Get("startMicros")
-	endMicros := values.Get("endMicros")
-	tags := values.Get("tags")
-	strLimit := values.Get("limit")
-	limit := 100
-	if strLimit != "" {
-		var err error
-		limit, err = strconv.Atoi(strLimit)
-		if err != nil {
+	q := models.TracingQuery{
+		End:   time.Now(),
+		Limit: 100,
+		Tags:  make(map[string]string),
+	}
+	if v := values.Get("startMicros"); v != "" {
+		if num, err := strconv.ParseInt(v, 10, 64); err == nil {
+			q.Start = time.Unix(0, num*int64(time.Microsecond))
+		} else {
+			return models.TracingQuery{}, fmt.Errorf("Cannot parse parameter 'startMicros': " + err.Error())
+		}
+	}
+	if v := values.Get("endMicros"); v != "" {
+		if num, err := strconv.ParseInt(v, 10, 64); err == nil {
+			q.End = time.Unix(0, num*int64(time.Microsecond))
+		} else {
+			return models.TracingQuery{}, fmt.Errorf("Cannot parse parameter 'endMicros': " + err.Error())
+		}
+	}
+	if strLimit := values.Get("limit"); strLimit != "" {
+		if num, err := strconv.Atoi(strLimit); err == nil {
+			q.Limit = num
+		} else {
 			return models.TracingQuery{}, fmt.Errorf("Cannot parse parameter 'limit': " + err.Error())
 		}
 	}
-	minDuration := values.Get("minDuration")
-	return models.TracingQuery{
-		StartMicros: startMicros,
-		EndMicros:   endMicros,
-		Tags:        tags,
-		Limit:       limit,
-		MinDuration: minDuration,
-	}, nil
+	if rawTags := values.Get("tags"); rawTags != "" {
+		var tags map[string]string
+		err := json.Unmarshal([]byte(rawTags), &tags)
+		if err != nil {
+			return models.TracingQuery{}, fmt.Errorf("Cannot parse parameter 'tags': " + err.Error())
+		}
+		q.Tags = tags
+	}
+	if strMinD := values.Get("minDuration"); strMinD != "" {
+		if num, err := strconv.Atoi(strMinD); err == nil {
+			q.MinDuration = time.Duration(num) * time.Microsecond
+		} else {
+			return models.TracingQuery{}, fmt.Errorf("Cannot parse parameter 'minDuration': " + err.Error())
+		}
+	}
+	return q, nil
 }

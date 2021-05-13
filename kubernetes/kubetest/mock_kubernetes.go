@@ -10,8 +10,13 @@ import (
 	"github.com/kiali/kiali/kubernetes"
 )
 
-func (o *K8SClientMock) GetConfigMap(namespace, configName string) (*core_v1.ConfigMap, error) {
-	args := o.Called(namespace, configName)
+func (o *K8SClientMock) GetClusterServicesByLabels(labelsSelector string) ([]core_v1.Service, error) {
+	args := o.Called(labelsSelector)
+	return args.Get(0).([]core_v1.Service), args.Error(1)
+}
+
+func (o *K8SClientMock) GetConfigMap(namespace, name string) (*core_v1.ConfigMap, error) {
+	args := o.Called(namespace, name)
 	return args.Get(0).(*core_v1.ConfigMap), args.Error(1)
 }
 
@@ -20,8 +25,18 @@ func (o *K8SClientMock) GetCronJobs(namespace string) ([]batch_apps_v1.CronJob, 
 	return args.Get(0).([]batch_apps_v1.CronJob), args.Error(1)
 }
 
-func (o *K8SClientMock) GetDeployment(namespace string, deploymentName string) (*apps_v1.Deployment, error) {
-	args := o.Called(namespace, deploymentName)
+func (o *K8SClientMock) GetDaemonSet(namespace string, name string) (*apps_v1.DaemonSet, error) {
+	args := o.Called(namespace, name)
+	return args.Get(0).(*apps_v1.DaemonSet), args.Error(1)
+}
+
+func (o *K8SClientMock) GetDaemonSets(namespace string) ([]apps_v1.DaemonSet, error) {
+	args := o.Called(namespace)
+	return args.Get(0).([]apps_v1.DaemonSet), args.Error(1)
+}
+
+func (o *K8SClientMock) GetDeployment(namespace string, name string) (*apps_v1.Deployment, error) {
+	args := o.Called(namespace, name)
 	return args.Get(0).(*apps_v1.Deployment), args.Error(1)
 }
 
@@ -35,8 +50,8 @@ func (o *K8SClientMock) GetDeploymentsByLabel(namespace string, labelSelector st
 	return args.Get(0).([]apps_v1.Deployment), args.Error(1)
 }
 
-func (o *K8SClientMock) GetEndpoints(namespace string, serviceName string) (*core_v1.Endpoints, error) {
-	args := o.Called(namespace, serviceName)
+func (o *K8SClientMock) GetEndpoints(namespace string, name string) (*core_v1.Endpoints, error) {
+	args := o.Called(namespace, name)
 	return args.Get(0).(*core_v1.Endpoints), args.Error(1)
 }
 
@@ -70,6 +85,11 @@ func (o *K8SClientMock) GetPodLogs(namespace, name string, opts *core_v1.PodLogO
 	return args.Get(0).(*kubernetes.PodLogs), args.Error(1)
 }
 
+func (o *K8SClientMock) GetPodProxy(namespace, name, path string) ([]byte, error) {
+	args := o.Called(namespace, name, path)
+	return args.Get(0).([]byte), args.Error(1)
+}
+
 func (o *K8SClientMock) GetReplicationControllers(namespace string) ([]core_v1.ReplicationController, error) {
 	args := o.Called(namespace)
 	return args.Get(0).([]core_v1.ReplicationController), args.Error(1)
@@ -80,13 +100,18 @@ func (o *K8SClientMock) GetReplicaSets(namespace string) ([]apps_v1.ReplicaSet, 
 	return args.Get(0).([]apps_v1.ReplicaSet), args.Error(1)
 }
 
+func (o *K8SClientMock) GetSecrets(namespace string, labelSelector string) ([]core_v1.Secret, error) {
+	args := o.Called(namespace, labelSelector)
+	return args.Get(0).([]core_v1.Secret), args.Error(1)
+}
+
 func (o *K8SClientMock) GetSelfSubjectAccessReview(namespace, api, resourceType string, verbs []string) ([]*auth_v1.SelfSubjectAccessReview, error) {
 	args := o.Called(namespace, api, resourceType, verbs)
 	return args.Get(0).([]*auth_v1.SelfSubjectAccessReview), args.Error(1)
 }
 
-func (o *K8SClientMock) GetService(namespace string, serviceName string) (*core_v1.Service, error) {
-	args := o.Called(namespace, serviceName)
+func (o *K8SClientMock) GetService(namespace string, name string) (*core_v1.Service, error) {
+	args := o.Called(namespace, name)
 	return args.Get(0).(*core_v1.Service), args.Error(1)
 }
 
@@ -95,8 +120,13 @@ func (o *K8SClientMock) GetServices(namespace string, selectorLabels map[string]
 	return args.Get(0).([]core_v1.Service), args.Error(1)
 }
 
-func (o *K8SClientMock) GetStatefulSet(namespace string, statefulsetName string) (*apps_v1.StatefulSet, error) {
-	args := o.Called(namespace, statefulsetName)
+func (o *K8SClientMock) GetServicesByLabels(namespace string, labelsSelector string) ([]core_v1.Service, error) {
+	args := o.Called(namespace, labelsSelector)
+	return args.Get(0).([]core_v1.Service), args.Error(1)
+}
+
+func (o *K8SClientMock) GetStatefulSet(namespace string, name string) (*apps_v1.StatefulSet, error) {
+	args := o.Called(namespace, name)
 	return args.Get(0).(*apps_v1.StatefulSet), args.Error(1)
 }
 
@@ -110,7 +140,12 @@ func (o *K8SClientMock) UpdateNamespace(namespace string, jsonPatch string) (*co
 	return args.Get(0).(*core_v1.Namespace), args.Error(1)
 }
 
-func (o *K8SClientMock) UpdateWorkload(namespace string, workloadName string, workloadType string, jsonPatch string) error {
-	args := o.Called(namespace, workloadName, workloadType, jsonPatch)
+func (o *K8SClientMock) UpdateWorkload(namespace string, name string, workloadType string, jsonPatch string) error {
+	args := o.Called(namespace, name, workloadType, jsonPatch)
+	return args.Error(1)
+}
+
+func (o *K8SClientMock) UpdateService(namespace string, name string, jsonPatch string) error {
+	args := o.Called(namespace, name, jsonPatch)
 	return args.Error(1)
 }

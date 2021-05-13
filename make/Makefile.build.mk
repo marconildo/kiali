@@ -7,7 +7,7 @@ clean:
 	@echo Cleaning...
 	@rm -f kiali
 	@rm -rf ${GOPATH}/bin/kiali
-	@[ -d ${GOPATH}/pkg/* ] && chmod -R +rw ${GOPATH}/pkg/* || true
+	@[ -d ${GOPATH}/pkg ] && chmod -R +rw ${GOPATH}/pkg/* || true
 	@rm -rf ${GOPATH}/pkg/*
 	@rm -rf ${OUTDIR}/docker
 
@@ -24,6 +24,14 @@ build: go-check
 	@echo Building...
 	${GO_BUILD_ENVVARS} ${GO} build \
 		-o ${GOPATH}/bin/kiali -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"
+
+## build-linux-multi-arch: Build Kiali binary with arch suffix for multi-arch
+build-linux-multi-arch:
+	@for arch in ${TARGET_ARCHS}; do \
+		echo "Building for architecture [$${arch}]"; \
+		${GO_BUILD_ENVVARS} GOOS=linux GOARCH=$${arch} ${GO} build \
+			-o ${GOPATH}/bin/kiali-$${arch} -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"; \
+	done
 
 ## install: Install missing dependencies. Runs `go install` internally
 install:
@@ -75,11 +83,6 @@ test-e2e:
 	@echo Running E2E tests
 	cd tests/e2e && source .kiali-e2e/bin/activate && pytest -s tests/
 
-## run: Run kiali binary
-run:
-	@echo Running...
-	@${GOPATH}/bin/kiali -v 4 -config config.yaml
-
 #
 # Swagger Documentation
 #
@@ -88,7 +91,7 @@ run:
 swagger-install:
 	@echo "Installing swagger binary to ${GOPATH}/bin..."
 ifeq ($(GOARCH), ppc64le)
-	curl https://github.com/go-swagger/go-swagger/archive/v${SWAGGER_VERSION}.tar.gz --create-dirs -Lo /tmp/v${SWAGGER_VERSION}.tar.gz && tar -xzf /tmp/v${SWAGGER_VERSION}.tar.gz -C /tmp/ && src_dir='pwd' && cd /tmp/go-swagger-${SWAGGER_VERSION} && go install ./cmd/swagger && cd ${src_dir}
+	curl https://github.com/go-swagger/go-swagger/archive/v${SWAGGER_VERSION}.tar.gz --create-dirs -Lo /tmp/v${SWAGGER_VERSION}.tar.gz && tar -xzf /tmp/v${SWAGGER_VERSION}.tar.gz -C /tmp/ && src_dir='pwd' && cd /tmp/go-swagger-${SWAGGER_VERSION} && ${GO} install ./cmd/swagger && cd ${src_dir}
 else
 	curl https://github.com/go-swagger/go-swagger/releases/download/v${SWAGGER_VERSION}/swagger_linux_${GOARCH} --create-dirs -Lo ${GOPATH}/bin/swagger && chmod +x ${GOPATH}/bin/swagger
 endif
@@ -100,13 +103,14 @@ swagger-validate:
 ## swagger-gen: Generate that swagger.json from Code. Runs `swagger generate` internally
 swagger-gen:
 	@swagger generate spec -o ./swagger.json
+	@swagger generate markdown --quiet --spec ./swagger.json --output ./kiali_api.md
 
 ## swagger-serve: Serve the swagger.json in a website in local. Runs `swagger serve` internally
 swagger-serve: swagger-validate
 	@swagger serve ./swagger.json
 
-## swagger-travis: Check that swagger.json is the correct one
-swagger-travis: swagger-validate
+## swagger-ci: Check that swagger.json is the correct one
+swagger-ci: swagger-validate
 	@swagger generate spec -o ./swagger_copy.json
 	@cmp -s swagger.json swagger_copy.json; \
 	RETVAL=$$?; \

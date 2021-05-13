@@ -4,153 +4,16 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	prom_v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 
+	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
-	"github.com/kiali/kiali/status"
 )
 
-const (
-	regexGrpcResponseStatusErr = "^[1-9]$|^1[0-6]$"
-	regexResponseCodeErr       = "^0$|^[4-5]\\\\d\\\\d$"
-)
-
-func getMetrics(api prom_v1.API, q *IstioMetricsQuery) Metrics {
-	labels, labelsError := buildLabelStrings(q)
-	grouping := strings.Join(q.ByLabels, ",")
-	metrics := fetchAllMetrics(api, q, labels, labelsError, grouping)
-	return metrics
-}
-
-func buildLabelStrings(q *IstioMetricsQuery) (string, []string) {
-	labels := []string{fmt.Sprintf(`reporter="%s"`, q.Reporter)}
-	ref := "destination"
-	if q.Direction == "outbound" {
-		ref = "source"
-	}
-
-	if q.Service != "" {
-		// inbound only
-		labels = append(labels, fmt.Sprintf(`destination_service_name="%s"`, q.Service))
-		if q.Namespace != "" {
-			labels = append(labels, fmt.Sprintf(`destination_service_namespace="%s"`, q.Namespace))
-		}
-	} else if q.Namespace != "" {
-		labels = append(labels, fmt.Sprintf(`%s_workload_namespace="%s"`, ref, q.Namespace))
-	}
-	if q.Workload != "" {
-		labels = append(labels, fmt.Sprintf(`%s_workload="%s"`, ref, q.Workload))
-	}
-	if q.App != "" {
-		if status.AreCanonicalMetricsAvailable() {
-			labels = append(labels, fmt.Sprintf(`%s_canonical_service="%s"`, ref, q.App))
-		} else {
-			labels = append(labels, fmt.Sprintf(`%s_app="%s"`, ref, q.App))
-		}
-	}
-	if q.RequestProtocol != "" {
-		labels = append(labels, fmt.Sprintf(`request_protocol="%s"`, q.RequestProtocol))
-	}
-	if q.Aggregate != "" {
-		labels = append(labels, fmt.Sprintf(`%s="%s"`, q.Aggregate, q.AggregateValue))
-	}
-
-	full := "{" + strings.Join(labels, ",") + "}"
-
-	errors := []string{}
-	protocol := strings.ToLower(q.RequestProtocol)
-
-	// both http and grpc requests can suffer from no response (response_code=0) or an http error
-	// (response_code=4xx,5xx), and so we always perform a query against response_code:
-	httpLabels := append(labels, fmt.Sprintf(`response_code=~"%s"`, regexResponseCodeErr))
-	errors = append(errors, "{"+strings.Join(httpLabels, ",")+"}")
-
-	// if necessary also look for grpc errors. note that the grpc test intentionally avoids
-	// `grpc_response_status!="0"`. We need to be backward compatible and handle the case where
-	// grpc_response_status does not exist, or if it is simply unset. In Prometheus, negative tests on a
-	// non-existent label match everything, but positive tests match nothing. So, we stay positive.
-	// furthermore, make sure we only count grpc errors with successful http status.
-	if protocol != "http" {
-		grpcLabels := append(labels, fmt.Sprintf(`grpc_response_status=~"%s",response_code!~"%s"`, regexGrpcResponseStatusErr, regexResponseCodeErr))
-		errors = append(errors, ("{" + strings.Join(grpcLabels, ",") + "}"))
-	}
-
-	return full, errors
-}
-
-func fetchAllMetrics(api prom_v1.API, q *IstioMetricsQuery, labels string, labelsError []string, grouping string) Metrics {
-	var wg sync.WaitGroup
-	fetchRate := func(p8sFamilyName string, metric **Metric, lbl []string) {
-		defer wg.Done()
-		m := fetchRateRange(api, p8sFamilyName, lbl, grouping, &q.BaseMetricsQuery)
-		*metric = m
-	}
-
-	fetchHisto := func(p8sFamilyName string, histo *Histogram) {
-		defer wg.Done()
-		h := fetchHistogramRange(api, p8sFamilyName, labels, grouping, &q.BaseMetricsQuery)
-		*histo = h
-	}
-
-	type resultHolder struct {
-		metric     *Metric
-		histo      Histogram
-		definition istioMetric
-	}
-	maxResults := len(istioMetrics)
-	if len(q.Filters) != 0 {
-		maxResults = len(q.Filters)
-	}
-	results := make([]*resultHolder, maxResults)
-
-	for _, istioMetric := range istioMetrics {
-		// if filters is empty, fetch all anyway
-		doFetch := len(q.Filters) == 0
-		if !doFetch {
-			for _, filter := range q.Filters {
-				if filter == istioMetric.kialiName {
-					doFetch = true
-					break
-				}
-			}
-		}
-		if doFetch {
-			wg.Add(1)
-			result := resultHolder{definition: istioMetric}
-			results = append(results, &result)
-			if istioMetric.isHisto {
-				go fetchHisto(istioMetric.istioName, &result.histo)
-			} else {
-				labelsToUse := istioMetric.labelsToUse(labels, labelsError)
-				go fetchRate(istioMetric.istioName, &result.metric, labelsToUse)
-			}
-		}
-	}
-	wg.Wait()
-
-	// Return results as two maps per reporter
-	metrics := make(map[string]*Metric)
-	histograms := make(map[string]Histogram)
-	for _, result := range results {
-		if result != nil {
-			if result.definition.isHisto {
-				histograms[result.definition.kialiName] = result.histo
-			} else {
-				metrics[result.definition.kialiName] = result.metric
-			}
-		}
-	}
-	return Metrics{
-		Metrics:    metrics,
-		Histograms: histograms,
-	}
-}
-
-func fetchRateRange(api prom_v1.API, metricName string, labels []string, grouping string, q *BaseMetricsQuery) *Metric {
+func fetchRateRange(ctx context.Context, api prom_v1.API, metricName string, labels []string, grouping string, q *RangeQuery) Metric {
 	var query string
 	// Example: round(sum(rate(my_counter{foo=bar}[5m])) by (baz), 0.001)
 	for i, labelsInstance := range labels {
@@ -167,15 +30,42 @@ func fetchRateRange(api prom_v1.API, metricName string, labels []string, groupin
 		query = fmt.Sprintf("(%s)", query)
 	}
 	query = roundSignificant(query, 0.001)
-	return fetchRange(api, query, q.Range)
+	return fetchRange(ctx, api, query, q.Range)
 }
 
-func fetchHistogramRange(api prom_v1.API, metricName, labels, grouping string, q *BaseMetricsQuery) Histogram {
-	histogram := make(Histogram)
-
+func fetchHistogramRange(ctx context.Context, api prom_v1.API, metricName, labels, grouping string, q *RangeQuery) Histogram {
 	// Note: the p8s queries are not run in parallel here, but they are at the caller's place.
 	//	This is because we may not want to create too many threads in the lowest layer
-	if q.Avg {
+	queries := buildHistogramQueries(metricName, labels, grouping, q.RateInterval, q.Avg, q.Quantiles)
+	histogram := make(Histogram, len(queries))
+	for k, query := range queries {
+		histogram[k] = fetchRange(ctx, api, query, q.Range)
+	}
+	return histogram
+}
+
+func fetchHistogramValues(ctx context.Context, api prom_v1.API, metricName, labels, grouping, rateInterval string, avg bool, quantiles []string, queryTime time.Time) (map[string]model.Vector, error) {
+	// Note: the p8s queries are not run in parallel here, but they are at the caller's place.
+	//	This is because we may not want to create too many threads in the lowest layer
+	queries := buildHistogramQueries(metricName, labels, grouping, rateInterval, avg, quantiles)
+	histogram := make(map[string]model.Vector, len(queries))
+	for k, query := range queries {
+		log.Tracef("[Prom] fetchHistogramValues: %s", query)
+		result, warnings, err := api.Query(ctx, query, queryTime)
+		if warnings != nil && len(warnings) > 0 {
+			log.Warningf("fetchHistogramValues. Prometheus Warnings: [%s]", strings.Join(warnings, ","))
+		}
+		if err != nil {
+			return nil, err
+		}
+		histogram[k] = result.(model.Vector)
+	}
+	return histogram, nil
+}
+
+func buildHistogramQueries(metricName, labels, grouping, rateInterval string, avg bool, quantiles []string) map[string]string {
+	queries := make(map[string]string)
+	if avg {
 		groupingAvg := ""
 		if grouping != "" {
 			groupingAvg = fmt.Sprintf(" by (%s)", grouping)
@@ -183,51 +73,55 @@ func fetchHistogramRange(api prom_v1.API, metricName, labels, grouping string, q
 		// Average
 		// Example: sum(rate(my_histogram_sum{foo=bar}[5m])) by (baz) / sum(rate(my_histogram_count{foo=bar}[5m])) by (baz)
 		query := fmt.Sprintf("sum(rate(%s_sum%s[%s]))%s / sum(rate(%s_count%s[%s]))%s",
-			metricName, labels, q.RateInterval, groupingAvg, metricName, labels, q.RateInterval, groupingAvg)
+			metricName, labels, rateInterval, groupingAvg, metricName, labels, rateInterval, groupingAvg)
 		query = roundSignificant(query, 0.001)
-		histogram["avg"] = fetchRange(api, query, q.Range)
+		queries["avg"] = query
 	}
 
 	groupingQuantile := ""
 	if grouping != "" {
 		groupingQuantile = fmt.Sprintf(",%s", grouping)
 	}
-	for _, quantile := range q.Quantiles {
+	for _, quantile := range quantiles {
 		// Example: round(histogram_quantile(0.5, sum(rate(my_histogram_bucket{foo=bar}[5m])) by (le,baz)), 0.001)
 		query := fmt.Sprintf("histogram_quantile(%s, sum(rate(%s_bucket%s[%s])) by (le%s))",
-			quantile, metricName, labels, q.RateInterval, groupingQuantile)
+			quantile, metricName, labels, rateInterval, groupingQuantile)
 		query = roundSignificant(query, 0.001)
-		histogram[quantile] = fetchRange(api, query, q.Range)
+		queries[quantile] = query
 	}
 
-	return histogram
+	return queries
 }
 
-func fetchRange(api prom_v1.API, query string, bounds prom_v1.Range) *Metric {
-	result, err := api.QueryRange(context.Background(), query, bounds)
+func fetchRange(ctx context.Context, api prom_v1.API, query string, bounds prom_v1.Range) Metric {
+	log.Tracef("[Prom] fetchRange: %s", query)
+	result, warnings, err := api.QueryRange(ctx, query, bounds)
+	if warnings != nil && len(warnings) > 0 {
+		log.Warningf("fetchRange. Prometheus Warnings: [%s]", strings.Join(warnings, ","))
+	}
 	if err != nil {
-		return &Metric{Err: err}
+		return Metric{Err: err}
 	}
 	switch result.Type() {
 	case model.ValMatrix:
-		return &Metric{Matrix: result.(model.Matrix)}
+		return Metric{Matrix: result.(model.Matrix)}
 	}
-	return &Metric{Err: fmt.Errorf("invalid query, matrix expected: %s", query)}
+	return Metric{Err: fmt.Errorf("invalid query, matrix expected: %s", query)}
 }
 
 // getAllRequestRates retrieves traffic rates for requests entering, internal to, or exiting the namespace.
 // Note that it does not discriminate on "reporter", so rates can be inflated due to duplication, and therefore
 // should be used mainly for calculating ratios (e.g total rates / error rates)
-func getAllRequestRates(api prom_v1.API, namespace string, queryTime time.Time, ratesInterval string) (model.Vector, error) {
+func getAllRequestRates(ctx context.Context, api prom_v1.API, namespace string, queryTime time.Time, ratesInterval string) (model.Vector, error) {
 	// traffic originating outside the namespace to destinations inside the namespace
 	lbl := fmt.Sprintf(`destination_service_namespace="%s",source_workload_namespace!="%s"`, namespace, namespace)
-	fromOutside, err := getRequestRatesForLabel(api, queryTime, lbl, ratesInterval)
+	fromOutside, err := getRequestRatesForLabel(ctx, api, queryTime, lbl, ratesInterval)
 	if err != nil {
 		return model.Vector{}, err
 	}
 	// traffic originating inside the namespace to destinations inside or outside the namespace
 	lbl = fmt.Sprintf(`source_workload_namespace="%s"`, namespace)
-	fromInside, err := getRequestRatesForLabel(api, queryTime, lbl, ratesInterval)
+	fromInside, err := getRequestRatesForLabel(ctx, api, queryTime, lbl, ratesInterval)
 	if err != nil {
 		return model.Vector{}, err
 	}
@@ -239,10 +133,10 @@ func getAllRequestRates(api prom_v1.API, namespace string, queryTime time.Time, 
 // getNamespaceServicesRequestRates retrieves traffic rates for requests entering or internal to the namespace.
 // Note that it does not discriminate on "reporter", so rates can be inflated due to duplication, and therefore
 // should be used mainly for calculating ratios (e.g total rates / error rates)
-func getNamespaceServicesRequestRates(api prom_v1.API, namespace string, queryTime time.Time, ratesInterval string) (model.Vector, error) {
+func getNamespaceServicesRequestRates(ctx context.Context, api prom_v1.API, namespace string, queryTime time.Time, ratesInterval string) (model.Vector, error) {
 	// traffic for the namespace services
 	lblNs := fmt.Sprintf(`destination_service_namespace="%s"`, namespace)
-	ns, err := getRequestRatesForLabel(api, queryTime, lblNs, ratesInterval)
+	ns, err := getRequestRatesForLabel(ctx, api, queryTime, lblNs, ratesInterval)
 	if err != nil {
 		return model.Vector{}, err
 	}
@@ -252,9 +146,9 @@ func getNamespaceServicesRequestRates(api prom_v1.API, namespace string, queryTi
 // getServiceRequestRates retrieves traffic rates for requests entering, or internal to the namespace, for a specific service name
 // Note that it does not discriminate on "reporter", so rates can be inflated due to duplication, and therefore
 // should be used mainly for calculating ratios (e.g total rates / error rates)
-func getServiceRequestRates(api prom_v1.API, namespace, service string, queryTime time.Time, ratesInterval string) (model.Vector, error) {
+func getServiceRequestRates(ctx context.Context, api prom_v1.API, namespace, service string, queryTime time.Time, ratesInterval string) (model.Vector, error) {
 	lbl := fmt.Sprintf(`destination_service_name="%s",destination_service_namespace="%s"`, service, namespace)
-	in, err := getRequestRatesForLabel(api, queryTime, lbl, ratesInterval)
+	in, err := getRequestRatesForLabel(ctx, api, queryTime, lbl, ratesInterval)
 	if err != nil {
 		return model.Vector{}, err
 	}
@@ -264,24 +158,28 @@ func getServiceRequestRates(api prom_v1.API, namespace, service string, queryTim
 // getItemRequestRates retrieves traffic rates for requests entering, internal to, or exiting the namespace, for a specific destinatation_<itemLabelSuffix> value
 // Note that it does not discriminate on "reporter", so rates can be inflated due to duplication, and therefore
 // should be used mainly for calculating ratios (e.g total rates / error rates)
-func getItemRequestRates(api prom_v1.API, namespace, item, itemLabelSuffix string, queryTime time.Time, ratesInterval string) (model.Vector, model.Vector, error) {
+func getItemRequestRates(ctx context.Context, api prom_v1.API, namespace, item, itemLabelSuffix string, queryTime time.Time, ratesInterval string) (model.Vector, model.Vector, error) {
 	lblIn := fmt.Sprintf(`destination_workload_namespace="%s",destination_%s="%s"`, namespace, itemLabelSuffix, item)
 	lblOut := fmt.Sprintf(`source_workload_namespace="%s",source_%s="%s"`, namespace, itemLabelSuffix, item)
-	in, err := getRequestRatesForLabel(api, queryTime, lblIn, ratesInterval)
+	in, err := getRequestRatesForLabel(ctx, api, queryTime, lblIn, ratesInterval)
 	if err != nil {
 		return model.Vector{}, model.Vector{}, err
 	}
-	out, err := getRequestRatesForLabel(api, queryTime, lblOut, ratesInterval)
+	out, err := getRequestRatesForLabel(ctx, api, queryTime, lblOut, ratesInterval)
 	if err != nil {
 		return model.Vector{}, model.Vector{}, err
 	}
 	return in, out, nil
 }
 
-func getRequestRatesForLabel(api prom_v1.API, time time.Time, labels, ratesInterval string) (model.Vector, error) {
+func getRequestRatesForLabel(ctx context.Context, api prom_v1.API, time time.Time, labels, ratesInterval string) (model.Vector, error) {
 	query := fmt.Sprintf("rate(istio_requests_total{%s}[%s]) > 0", labels, ratesInterval)
+	log.Tracef("[Prom] getRequestRatesForLabel: %s", query)
 	promtimer := internalmetrics.GetPrometheusProcessingTimePrometheusTimer("Metrics-GetRequestRates")
-	result, err := api.Query(context.Background(), query, time)
+	result, warnings, err := api.Query(ctx, query, time)
+	if warnings != nil && len(warnings) > 0 {
+		log.Warningf("fetchHistogramValues. Prometheus Warnings: [%s]", strings.Join(warnings, ","))
+	}
 	if err != nil {
 		return model.Vector{}, err
 	}

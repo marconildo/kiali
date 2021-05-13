@@ -41,6 +41,8 @@ func NewRouter() *mux.Router {
 			r.URL.Path = webRootWithSlash
 			rootRouter.ServeHTTP(w, r)
 		})
+	} else {
+		webRootWithSlash = "/"
 	}
 
 	appRouter = appRouter.StrictSlash(true)
@@ -49,10 +51,11 @@ func NewRouter() *mux.Router {
 	apiRoutes := NewRoutes()
 	authenticationHandler, _ := handlers.NewAuthenticationHandler()
 	for _, route := range apiRoutes.Routes {
-		var handlerFunction http.Handler = authenticationHandler.HandleUnauthenticated(route.HandlerFunc)
-		handlerFunction = metricHandler(handlerFunction, route)
+		handlerFunction := metricHandler(route.HandlerFunc, route)
 		if route.Authenticated {
-			handlerFunction = authenticationHandler.Handle(route.HandlerFunc)
+			handlerFunction = authenticationHandler.Handle(handlerFunction)
+		} else {
+			handlerFunction = authenticationHandler.HandleUnauthenticated(handlerFunction)
 		}
 		appRouter.
 			Methods(route.Method).
@@ -68,7 +71,7 @@ func NewRouter() *mux.Router {
 	})
 
 	if conf.Auth.Strategy == config.AuthStrategyOpenId {
-		appRouter.Methods("GET").Path("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rootRouter.Methods("GET").Path(webRootWithSlash).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !handlers.OpenIdCodeFlowHandler(w, r) {
 				// If the OpenID handler does not handle the request, pass the
 				// request to the file server.
@@ -77,7 +80,7 @@ func NewRouter() *mux.Router {
 		})
 	}
 
-	appRouter.PathPrefix("/").Handler(staticFileServer)
+	rootRouter.PathPrefix(webRootWithSlash).Handler(staticFileServer)
 
 	return rootRouter
 }

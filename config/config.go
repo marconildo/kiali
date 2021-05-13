@@ -40,11 +40,13 @@ const (
 	AuthStrategyAnonymous = "anonymous"
 	AuthStrategyToken     = "token"
 	AuthStrategyOpenId    = "openid"
+	AuthStrategyHeader    = "header"
 
 	TokenCookieName             = "kiali-token"
 	AuthStrategyOpenshiftIssuer = "kiali-openshift"
 	AuthStrategyTokenIssuer     = "kiali-token"
 	AuthStrategyOpenIdIssuer    = "kiali-open-id"
+	AuthStrategyHeaderIssuer    = "kiali-header"
 
 	// These constants are used for external services auth (Prometheus, Grafana ...) ; not for Kiali auth
 	AuthTypeBasic  = "basic"
@@ -55,6 +57,11 @@ const (
 const (
 	IstioMultiClusterHostSuffix = "global"
 	OidcClientSecretFile        = "/kiali-secret/oidc-secret"
+)
+
+const (
+	DashboardsDiscoveryEnabled = "true"
+	DashboardsDiscoveryAuto    = "auto"
 )
 
 // Global configuration for the application.
@@ -72,7 +79,9 @@ type Server struct {
 	Port                       int    `yaml:",omitempty"`
 	StaticContentRootDirectory string `yaml:"static_content_root_directory,omitempty"`
 	WebFQDN                    string `yaml:"web_fqdn,omitempty"`
+	WebPort                    string `yaml:"web_port,omitempty"`
 	WebRoot                    string `yaml:"web_root,omitempty"`
+	WebHistoryMode             string `yaml:"web_history_mode,omitempty"`
 	WebSchema                  string `yaml:"web_schema,omitempty"`
 }
 
@@ -96,26 +105,37 @@ func (a *Auth) Obfuscate() {
 
 // PrometheusConfig describes configuration of the Prometheus component
 type PrometheusConfig struct {
-	Auth            Auth            `yaml:"auth,omitempty"`
-	ComponentStatus ComponentStatus `yaml:"component_status,omitempty"`
-	URL             string          `yaml:"url,omitempty"`
+	Auth Auth `yaml:"auth,omitempty"`
+	// Cache duration per query expressed in seconds
+	CacheDuration int `yaml:"cache_duration,omitempty"`
+	// Enable cache for Prometheus queries
+	CacheEnabled bool `yaml:"cache_enabled,omitempty"`
+	// Global cache expiration expressed in seconds
+	CacheExpiration int    `yaml:"cache_expiration,omitempty"`
+	HealthCheckUrl  string `yaml:"health_check_url,omitempty"`
+	IsCore          bool   `yaml:"is_core,omitempty"`
+	URL             string `yaml:"url,omitempty"`
 }
 
 // CustomDashboardsConfig describes configuration specific to Custom Dashboards
 type CustomDashboardsConfig struct {
-	Enabled        bool             `yaml:"enabled,omitempty"`
-	NamespaceLabel string           `yaml:"namespace_label,omitempty"`
-	Prometheus     PrometheusConfig `yaml:"prometheus,omitempty"`
+	DiscoveryEnabled       string           `yaml:"discovery_enabled,omitempty"`
+	DiscoveryAutoThreshold int              `yaml:"discovery_auto_threshold,omitempty"`
+	Enabled                bool             `yaml:"enabled,omitempty"`
+	IsCore                 bool             `yaml:"is_core,omitempty"`
+	NamespaceLabel         string           `yaml:"namespace_label,omitempty"`
+	Prometheus             PrometheusConfig `yaml:"prometheus,omitempty"`
 }
 
 // GrafanaConfig describes configuration used for Grafana links
 type GrafanaConfig struct {
-	Auth            Auth                     `yaml:"auth"`
-	ComponentStatus ComponentStatus          `yaml:"component_status,omitempty"`
-	Dashboards      []GrafanaDashboardConfig `yaml:"dashboards"`
-	Enabled         bool                     `yaml:"enabled"` // Enable or disable Grafana support in Kiali
-	InClusterURL    string                   `yaml:"in_cluster_url"`
-	URL             string                   `yaml:"url"`
+	Auth           Auth                     `yaml:"auth"`
+	Dashboards     []GrafanaDashboardConfig `yaml:"dashboards"`
+	Enabled        bool                     `yaml:"enabled"` // Enable or disable Grafana support in Kiali
+	HealthCheckUrl string                   `yaml:"health_check_url,omitempty"`
+	InClusterURL   string                   `yaml:"in_cluster_url"`
+	IsCore         bool                     `yaml:"is_core,omitempty"`
+	URL            string                   `yaml:"url"`
 }
 
 type GrafanaDashboardConfig struct {
@@ -133,23 +153,28 @@ type GrafanaVariablesConfig struct {
 
 // TracingConfig describes configuration used for tracing links
 type TracingConfig struct {
-	Auth                 Auth            `yaml:"auth"`
-	ComponentStatus      ComponentStatus `yaml:"component_status,omitempty"`
-	Enabled              bool            `yaml:"enabled"` // Enable Jaeger in Kiali
-	InClusterURL         string          `yaml:"in_cluster_url"`
-	NamespaceSelector    bool            `yaml:"namespace_selector"`
-	URL                  string          `yaml:"url"`
-	WhiteListIstioSystem []string        `yaml:"whitelist_istio_system"`
+	Auth                 Auth     `yaml:"auth"`
+	Enabled              bool     `yaml:"enabled"` // Enable Jaeger in Kiali
+	HealthCheckUrl       string   `yaml:"health_check_url,omitempty"`
+	InClusterURL         string   `yaml:"in_cluster_url"`
+	IsCore               bool     `yaml:"is_core,omitempty"`
+	NamespaceSelector    bool     `yaml:"namespace_selector"`
+	URL                  string   `yaml:"url"`
+	UseGRPC              bool     `yaml:"use_grpc"`
+	WhiteListIstioSystem []string `yaml:"whitelist_istio_system"`
 }
 
 // IstioConfig describes configuration used for istio links
 type IstioConfig struct {
-	ComponentStatuses        ComponentStatuses `yaml:"component_status,omitempty"`
-	ConfigMapName            string            `yaml:"config_map_name,omitempty"`
-	IstioIdentityDomain      string            `yaml:"istio_identity_domain,omitempty"`
-	IstioInjectionAnnotation string            `yaml:"istio_injection_annotation,omitempty"`
-	IstioSidecarAnnotation   string            `yaml:"istio_sidecar_annotation,omitempty"`
-	UrlServiceVersion        string            `yaml:"url_service_version"`
+	ComponentStatuses                 ComponentStatuses `yaml:"component_status,omitempty"`
+	ConfigMapName                     string            `yaml:"config_map_name,omitempty"`
+	EnvoyAdminLocalPort               int               `yaml:"envoy_admin_local_port,omitempty"`
+	IstioIdentityDomain               string            `yaml:"istio_identity_domain,omitempty"`
+	IstioInjectionAnnotation          string            `yaml:"istio_injection_annotation,omitempty"`
+	IstioSidecarInjectorConfigMapName string            `yaml:"istio_sidecar_injector_config_map_name,omitempty"`
+	IstioSidecarAnnotation            string            `yaml:"istio_sidecar_annotation,omitempty"`
+	IstiodDeploymentName              string            `yaml:"istiod_deployment_name,omitempty"`
+	UrlServiceVersion                 string            `yaml:"url_service_version"`
 }
 
 type ComponentStatuses struct {
@@ -163,26 +188,16 @@ type ComponentStatus struct {
 	Namespace string `yaml:"namespace,omitempty"`
 }
 
-// ThreeScaleConfig describes configuration used for 3Scale adapter
-type ThreeScaleConfig struct {
-	AdapterName    string `yaml:"adapter_name"`
-	AdapterPort    string `yaml:"adapter_port"`
-	AdapterService string `yaml:"adapter_service"`
-	Enabled        bool   `yaml:"enabled"`
-	TemplateName   string `yaml:"template_name"`
-}
-
 type Iter8Config struct {
 	Enabled bool `yaml:"enabled"`
-	// Defein which namespace Iter8 is installed on, default to iter8
+	// Define which namespace Iter8 is installed on, default to iter8
 	Namespace string `yaml:"namespace"`
 }
 
 // Extensions struct describes configuration for Kiali add-ons (extensions)
-// New add-on/extension configuration should create a specif config and be located under this
+// New add-on/extension configuration should create a specific config and be located under this
 type Extensions struct {
-	ThreeScale ThreeScaleConfig `yaml:"threescale,omitempty"`
-	Iter8      Iter8Config      `yaml:"iter_8,omitempty"`
+	Iter8 Iter8Config `yaml:"iter_8,omitempty"`
 }
 
 // ExternalServices holds configurations for other systems that Kiali depends on
@@ -268,16 +283,21 @@ type OpenShiftConfig struct {
 
 // OpenIdConfig contains specific configuration for authentication using an OpenID provider
 type OpenIdConfig struct {
-	ApiProxy              string   `yaml:"api_proxy,omitempty"`
-	ApiProxyCAData        string   `yaml:"api_proxy_ca_data,omitempty"`
-	AuthenticationTimeout int      `yaml:"authentication_timeout,omitempty"`
-	AuthorizationEndpoint string   `yaml:"authorization_endpoint,omitempty"`
-	ClientId              string   `yaml:"client_id,omitempty"`
-	ClientSecret          string   `yaml:"client_secret,omitempty"`
-	InsecureSkipVerifyTLS bool     `yaml:"insecure_skip_verify_tls,omitempty"`
-	IssuerUri             string   `yaml:"issuer_uri,omitempty"`
-	Scopes                []string `yaml:"scopes,omitempty"`
-	UsernameClaim         string   `yaml:"username_claim,omitempty"`
+	AdditionalRequestParams map[string]string `yaml:"additional_request_params,omitempty"`
+	ApiProxy                string            `yaml:"api_proxy,omitempty"`
+	ApiProxyCAData          string            `yaml:"api_proxy_ca_data,omitempty"`
+	AuthenticationTimeout   int               `yaml:"authentication_timeout,omitempty"`
+	ApiToken                string            `yaml:"api_token,omitempty"`
+	AuthorizationEndpoint   string            `yaml:"authorization_endpoint,omitempty"`
+	ClientId                string            `yaml:"client_id,omitempty"`
+	ClientSecret            string            `yaml:"client_secret,omitempty"`
+	DisableRBAC             bool              `yaml:"disable_rbac,omitempty"`
+	HTTPProxy               string            `yaml:"http_proxy,omitempty"`
+	HTTPSProxy              string            `yaml:"https_proxy,omitempty"`
+	InsecureSkipVerifyTLS   bool              `yaml:"insecure_skip_verify_tls,omitempty"`
+	IssuerUri               string            `yaml:"issuer_uri,omitempty"`
+	Scopes                  []string          `yaml:"scopes,omitempty"`
+	UsernameClaim           string            `yaml:"username_claim,omitempty"`
 }
 
 // DeploymentConfig provides details on how Kiali was deployed.
@@ -290,11 +310,20 @@ type DeploymentConfig struct {
 // defaults to the namespace configured for IstioNamespace (which itself defaults to 'istio-system').
 type IstioComponentNamespaces map[string]string
 
-type KialiFeatureFlags struct {
-	IstioInjectionAction bool `yaml:"istio_injection_action,omitempty" json:"istioInjectionAction"`
+// UIDefaults defines default settings configured for the UI
+type UIDefaults struct {
+	MetricsPerRefresh string   `yaml:"metrics_per_refresh,omitempty" json:"metricsPerRefresh,omitempty"`
+	Namespaces        []string `yaml:"namespaces,omitempty" json:"namespaces,omitempty"`
+	RefreshInterval   string   `yaml:"refresh_interval,omitempty" json:"refreshInterval,omitempty"`
 }
 
-// ToleranceConfig
+// KialiFeatureFlags available from the CR
+type KialiFeatureFlags struct {
+	IstioInjectionAction bool       `yaml:"istio_injection_action,omitempty" json:"istioInjectionAction"`
+	UIDefaults           UIDefaults `yaml:"ui_defaults,omitempty" json:"uiDefaults,omitempty"`
+}
+
+// Tolerance config
 type Tolerance struct {
 	Code      string  `yaml:"code,omitempty" json:"code"`
 	Degraded  float32 `yaml:"degraded,omitempty" json:"degraded"`
@@ -303,17 +332,17 @@ type Tolerance struct {
 	Direction string  `yaml:"direction,omitempty" json:"direction"`
 }
 
-// RateConfig
+// Rate config
 type Rate struct {
-	Namespace string      `yaml:"namespace,omitempty" json:"namespace"`
-	Kind      string      `yaml:"kind,omitempty" json:"kind"`
-	Name      string      `yaml:"name,omitempty" json:"name"`
+	Namespace string      `yaml:"namespace,omitempty" json:"namespace,omitempty"`
+	Kind      string      `yaml:"kind,omitempty" json:"kind,omitempty"`
+	Name      string      `yaml:"name,omitempty" json:"name,omitempty"`
 	Tolerance []Tolerance `yaml:"tolerance,omitempty" json:"tolerance"`
 }
 
-// HealthConfig
+// HealthConfig rates
 type HealthConfig struct {
-	Rate []Rate `yaml:"rate,omitempty" json:"rate"`
+	Rate []Rate `yaml:"rate,omitempty" json:"rate,omitempty"`
 }
 
 // Config defines full YAML configuration.
@@ -324,7 +353,7 @@ type Config struct {
 	Deployment               DeploymentConfig         `yaml:"deployment,omitempty"`
 	Extensions               Extensions               `yaml:"extensions,omitempty"`
 	ExternalServices         ExternalServices         `yaml:"external_services,omitempty"`
-	HealthConfig             HealthConfig             `yaml:"health_config,omitempty" json:"healthConfig"`
+	HealthConfig             HealthConfig             `yaml:"health_config,omitempty" json:"healthConfig,omitempty"`
 	Identity                 security.Identity        `yaml:",omitempty"`
 	InCluster                bool                     `yaml:"in_cluster,omitempty"`
 	InstallationTag          string                   `yaml:"installation_tag,omitempty"`
@@ -356,16 +385,19 @@ func NewConfig() (c *Config) {
 		Auth: AuthConfig{
 			Strategy: "token",
 			OpenId: OpenIdConfig{
-				ApiProxy:              "",
-				ApiProxyCAData:        "",
-				AuthenticationTimeout: 300,
-				AuthorizationEndpoint: "",
-				ClientId:              "",
-				ClientSecret:          "",
-				InsecureSkipVerifyTLS: false,
-				IssuerUri:             "",
-				Scopes:                []string{"openid", "profile", "email"},
-				UsernameClaim:         "sub",
+				AdditionalRequestParams: map[string]string{},
+				ApiProxy:                "",
+				ApiProxyCAData:          "",
+				AuthenticationTimeout:   300,
+				ApiToken:                "id_token",
+				AuthorizationEndpoint:   "",
+				ClientId:                "",
+				ClientSecret:            "",
+				DisableRBAC:             false,
+				InsecureSkipVerifyTLS:   false,
+				IssuerUri:               "",
+				Scopes:                  []string{"openid", "profile", "email"},
+				UsernameClaim:           "sub",
 			},
 			OpenShift: OpenShiftConfig{
 				ClientIdPrefix: "kiali",
@@ -376,13 +408,6 @@ func NewConfig() (c *Config) {
 			Namespace:            "istio-system",
 		},
 		Extensions: Extensions{
-			ThreeScale: ThreeScaleConfig{
-				AdapterName:    "threescale",
-				AdapterPort:    "3333",
-				AdapterService: "threescale-istio-adapter",
-				Enabled:        false,
-				TemplateName:   "threescale-authorization",
-			},
 			Iter8: Iter8Config{
 				Enabled:   false,
 				Namespace: "iter8",
@@ -390,23 +415,20 @@ func NewConfig() (c *Config) {
 		},
 		ExternalServices: ExternalServices{
 			CustomDashboards: CustomDashboardsConfig{
-				Enabled:        true,
-				NamespaceLabel: "kubernetes_namespace",
+				DiscoveryEnabled:       DashboardsDiscoveryAuto,
+				DiscoveryAutoThreshold: 10,
+				Enabled:                true,
+				IsCore:                 false,
+				NamespaceLabel:         "kubernetes_namespace",
 			},
 			Grafana: GrafanaConfig{
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
 				Enabled: true,
-				ComponentStatus: ComponentStatus{
-					AppLabel: "grafana",
-					IsCore:   false,
-				},
+				IsCore:  false,
 			},
 			Istio: IstioConfig{
-				IstioIdentityDomain:      "svc.cluster.local",
-				IstioInjectionAnnotation: "sidecar.istio.io/inject",
-				IstioSidecarAnnotation:   "sidecar.istio.io/status",
 				ComponentStatuses: ComponentStatuses{
 					Enabled: true,
 					Components: []ComponentStatus{
@@ -424,31 +446,36 @@ func NewConfig() (c *Config) {
 						},
 					},
 				},
-				ConfigMapName:     "istio",
-				UrlServiceVersion: "http://istiod:15014/version",
+				ConfigMapName:                     "istio",
+				EnvoyAdminLocalPort:               15000,
+				IstioIdentityDomain:               "svc.cluster.local",
+				IstioInjectionAnnotation:          "sidecar.istio.io/inject",
+				IstioSidecarInjectorConfigMapName: "istio-sidecar-injector",
+				IstioSidecarAnnotation:            "sidecar.istio.io/status",
+				IstiodDeploymentName:              "istiod",
+				UrlServiceVersion:                 "http://istiod:15014/version",
 			},
 			Prometheus: PrometheusConfig{
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				ComponentStatus: ComponentStatus{
-					AppLabel: "prometheus",
-					IsCore:   true,
-				},
-				URL: "http://prometheus.istio-system:9090",
+				CacheEnabled: true,
+				// 1/2 Prom Scrape Interval
+				CacheDuration: 7,
+				// Prom Cache expires and it forces to repopulate cache
+				CacheExpiration: 300,
+				URL:             "http://prometheus.istio-system:9090",
 			},
 			Tracing: TracingConfig{
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				ComponentStatus: ComponentStatus{
-					AppLabel: "jaeger",
-					IsCore:   false,
-				},
 				Enabled:              true,
 				NamespaceSelector:    true,
 				InClusterURL:         "http://tracing.istio-system/jaeger",
+				IsCore:               false,
 				URL:                  "",
+				UseGRPC:              false,
 				WhiteListIstioSystem: []string{"jaeger-query", "istio-ingressgateway"},
 			},
 		},
@@ -459,6 +486,11 @@ func NewConfig() (c *Config) {
 		},
 		KialiFeatureFlags: KialiFeatureFlags{
 			IstioInjectionAction: true,
+			UIDefaults: UIDefaults{
+				MetricsPerRefresh: "1m",
+				Namespaces:        make([]string, 0),
+				RefreshInterval:   "15s",
+			},
 		},
 		KubernetesConfig: KubernetesConfig{
 			Burst:                       200,
@@ -483,6 +515,7 @@ func NewConfig() (c *Config) {
 			StaticContentRootDirectory: "/opt/kiali/console",
 			WebFQDN:                    "",
 			WebRoot:                    "/",
+			WebHistoryMode:             "browser",
 			WebSchema:                  "",
 		},
 	}
@@ -496,18 +529,15 @@ func (conf *Config) AddHealthDefault() {
 	healthConfig := HealthConfig{
 		Rate: []Rate{
 			{
-				Namespace: ".*",
-				Kind:      ".*",
-				Name:      ".*",
 				Tolerance: []Tolerance{
 					{
-						Code:      "^5\\d\\d$",
+						Code:      "5XX",
 						Protocol:  "http",
 						Direction: ".*",
 						Failure:   10,
 					},
 					{
-						Code:      "^4\\d\\d$",
+						Code:      "4XX",
 						Protocol:  "http",
 						Direction: ".*",
 						Degraded:  10,
@@ -675,24 +705,6 @@ func SaveToFile(filename string, conf *Config) (err error) {
 	log.Debugf("Writing YAML config to [%s]", filename)
 	err = ioutil.WriteFile(filename, []byte(fileContent), 0640)
 	return
-}
-
-// GetIstioNamespaces returns all Istio namespaces, less the exclusions
-func GetIstioNamespaces(exclude []string) []string {
-	excludeMap := map[string]bool{}
-	for _, e := range exclude {
-		excludeMap[e] = true
-	}
-	result := []string{}
-	if _, found := excludeMap[configuration.IstioNamespace]; !found {
-		result = append(result, configuration.IstioNamespace)
-	}
-	for _, ns := range configuration.IstioComponentNamespaces {
-		if _, found := excludeMap[ns]; !found {
-			result = append(result, ns)
-		}
-	}
-	return result
 }
 
 // IsIstioNamespace returns true if the namespace is the default istio namespace or an Istio component namespace

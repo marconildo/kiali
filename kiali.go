@@ -25,8 +25,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/golang/glog"
-
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
@@ -53,7 +51,8 @@ func init() {
 }
 
 func main() {
-	defer glog.Flush()
+
+	log.InitializeLogger()
 	util.Clock = util.RealClock{}
 
 	// process command line
@@ -68,7 +67,7 @@ func main() {
 	if *argConfigFile != "" {
 		c, err := config.LoadFromFile(*argConfigFile)
 		if err != nil {
-			glog.Fatal(err)
+			log.Fatal(err)
 		}
 		config.Set(c)
 	} else {
@@ -78,7 +77,7 @@ func main() {
 	log.Tracef("Kiali Configuration:\n%s", config.Get())
 
 	if err := validateConfig(); err != nil {
-		glog.Fatal(err)
+		log.Fatal(err)
 	}
 
 	consoleVersion := determineConsoleVersion()
@@ -89,10 +88,8 @@ func main() {
 	status.Put(status.CoreCommitHash, commitHash)
 	status.Put(status.ContainerVersion, determineContainerVersion(version))
 
-	if webRoot := config.Get().Server.WebRoot; webRoot != "/" {
-		updateBaseURL(webRoot)
-		configToJS()
-	}
+	updateBaseURL(config.Get().Server.WebRoot)
+	configToJS()
 
 	// prepare our internal metrics so Prometheus can scrape them
 	internalmetrics.RegisterInternalMetrics()
@@ -157,7 +154,8 @@ func validateConfig() error {
 		log.Warningf("Kiali auth strategy is configured for anonymous access - users will not be authenticated.")
 	} else if auth.Strategy != config.AuthStrategyOpenId &&
 		auth.Strategy != config.AuthStrategyOpenshift &&
-		auth.Strategy != config.AuthStrategyToken {
+		auth.Strategy != config.AuthStrategyToken &&
+		auth.Strategy != config.AuthStrategyHeader {
 		return fmt.Errorf("Invalid authentication strategy [%v]", auth.Strategy)
 	}
 
@@ -211,7 +209,15 @@ func configToJS() {
 	log.Info("Generating env.js from config")
 	path, _ := filepath.Abs("./console/env.js")
 
-	content := "window.WEB_ROOT='" + config.Get().Server.WebRoot + "';"
+	conf := config.Get()
+	var content string
+	if len(conf.Server.WebHistoryMode) > 0 {
+		content += fmt.Sprintf("window.HISTORY_MODE='%s';\n", conf.Server.WebHistoryMode)
+	}
+
+	if webRoot := strings.TrimSuffix(config.Get().Server.WebRoot, "/"); len(webRoot) > 0 {
+		content += fmt.Sprintf("window.WEB_ROOT='%s';\n", webRoot)
+	}
 
 	log.Debugf("The content of %v will be:\n%v", path, content)
 
@@ -223,7 +229,8 @@ func configToJS() {
 
 // updateBaseURL updates index.html base href with web root string
 func updateBaseURL(webRootPath string) {
-	if webRootPath == "/" {
+	webRootPath = strings.TrimSuffix(webRootPath, "/")
+	if len(webRootPath) == 0 {
 		return // nothing to do - our web root path is already /
 	}
 
@@ -256,5 +263,5 @@ func isError(err error) bool {
 		log.Errorf("File I/O error [%v]", err.Error())
 	}
 
-	return (err != nil)
+	return err != nil
 }

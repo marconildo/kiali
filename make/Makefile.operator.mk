@@ -3,7 +3,7 @@
 #
 
 .ensure-operator-is-running: .ensure-oc-exists
-	@${OC} get pods -l app=kiali-operator -n kiali-operator 2>/dev/null | grep "^kiali-operator.*Running" > /dev/null ;\
+	@${OC} get pods -l app.kubernetes.io/name=kiali-operator -n kiali-operator 2>/dev/null | grep "^kiali-operator.*Running" > /dev/null ;\
 	RETVAL=$$?; \
 	if [ $$RETVAL -ne 0 ]; then \
 	  echo "The Operator is not running. Cannot continue."; exit 1; \
@@ -30,6 +30,9 @@ operator-create: .ensure-operator-repo-exists .ensure-operator-helm-chart-exists
 	${ROOTDIR}/operator/deploy/deploy-kiali-operator.sh \
     --helm-chart                    "$(shell ls -dt1 ${HELM_CHARTS_REPO}/_output/charts/kiali-operator*.tgz | head -n 1)" \
     --helm-exe                      "${HELM}" \
+    --helm-set                      "debug.enableProfiler=${OPERATOR_PROFILER_ENABLED}" \
+    --helm-set                      "allowAdHocKialiNamespace=${OPERATOR_ALLOW_AD_HOC_KIALI_NAMESPACE}" \
+    --helm-set                      "allowAdHocKialiImage=${OPERATOR_ALLOW_AD_HOC_KIALI_IMAGE}" \
     --operator-cluster-role-creator "true" \
     --operator-image-name           "${CLUSTER_OPERATOR_INTERNAL_NAME}" \
     --operator-image-pull-policy    "${OPERATOR_IMAGE_PULL_POLICY}" \
@@ -69,36 +72,46 @@ ISTIO_NAMESPACE="${ISTIO_NAMESPACE}" \
 NAMESPACE="${NAMESPACE}" \
 ROUTER_HOSTNAME="$(shell ${OC} get $(shell (${OC} get routes -n ${NAMESPACE} -o name 2>/dev/null || echo 'noroute') | head -n 1) -n ${NAMESPACE} -o jsonpath='{.status.ingress[0].routerCanonicalHostname}' 2>/dev/null)" \
 SERVICE_TYPE="${SERVICE_TYPE}" \
-VERBOSE_MODE="${VERBOSE_MODE}" \
 KIALI_CR_SPEC_VERSION="${KIALI_CR_SPEC_VERSION}" \
 envsubst | ${OC} apply -n "${OPERATOR_INSTALL_KIALI_CR_NAMESPACE}" -f -
+ifeq ($(IS_MAISTRA),true)
+	@echo "Deploying within a Maistra environment - create network policy to enable access to the Kiali UI"
+	@echo '{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"labels":{"app.kubernetes.io/name":"kiali"},"name":"kiali-network-policy-from-make"},"spec":{"ingress":[{}],"podSelector":{"matchLabels":{"app":"kiali"}},"policyTypes":["Ingress"]}}' | ${OC} apply -n ${NAMESPACE} -f -
+endif
 
 ## kiali-delete: Remove a Kiali CR from the cluster, informing the Kiali operator to uninstall Kiali.
 kiali-delete: .ensure-oc-exists
 	@echo Remove Kiali
 	${OC} delete --ignore-not-found=true kiali kiali -n "${OPERATOR_INSTALL_KIALI_CR_NAMESPACE}" ; true
+	@echo "Remove NetworkPolicy if it exists (was only created within Maistra environment)"
+	${OC} delete --ignore-not-found=true networkpolicies.networking.k8s.io -n ${NAMESPACE} kiali-network-policy-from-make
 
 ## kiali-purge: Purges all Kiali resources directly without going through the operator or ansible.
 kiali-purge: .ensure-oc-exists
 	@echo Purge Kiali resources
 	${OC} patch kiali kiali -n "${OPERATOR_INSTALL_KIALI_CR_NAMESPACE}" -p '{"metadata":{"finalizers": []}}' --type=merge ; true
-	${OC} delete --ignore-not-found=true all,secrets,sa,configmaps,deployments,roles,rolebindings,ingresses --selector="app=kiali" -n "${NAMESPACE}"
-	${OC} delete --ignore-not-found=true clusterroles,clusterrolebindings --selector="app=kiali"
+	${OC} delete --ignore-not-found=true all,secrets,sa,configmaps,deployments,roles,rolebindings,ingresses,horizontalpodautoscalers --selector="app.kubernetes.io/name=kiali" -n "${NAMESPACE}"
+	${OC} delete --ignore-not-found=true clusterroles,clusterrolebindings --selector="app.kubernetes.io/name=kiali"
+	${OC} delete --ignore-not-found=true networkpolicies.networking.k8s.io -n ${NAMESPACE} kiali-network-policy-from-make
 ifeq ($(CLUSTER_TYPE),openshift)
-	${OC} delete --ignore-not-found=true routes --selector="app=kiali" -n "${NAMESPACE}" ; true
-	${OC} delete --ignore-not-found=true consolelinks.console.openshift.io,oauthclients.oauth.openshift.io --selector="app=kiali" ; true
+	${OC} delete --ignore-not-found=true routes --selector="app.kubernetes.io/name=kiali" -n "${NAMESPACE}" ; true
+	${OC} delete --ignore-not-found=true consolelinks.console.openshift.io,oauthclients.oauth.openshift.io --selector="app.kubernetes.io/name=kiali" ; true
 endif
 
 ## kiali-reload-image: Refreshing the Kiali pod by deleting it which forces a redeployment
 kiali-reload-image: .ensure-oc-exists
 	@echo Refreshing Kiali pod within namespace ${NAMESPACE}
-	${OC} delete pod --selector=app=kiali -n ${NAMESPACE}
+	${OC} delete pod --selector=app.kubernetes.io/name=kiali -n ${NAMESPACE}
 
 ## run-operator-playbook: Run the operator dev playbook to run the operator ansible script locally.
 run-operator-playbook: .ensure-operator-repo-exists .ensure-operator-helm-chart-exists
-	ANSIBLE_ROLES_PATH=${ROOTDIR}/operator/roles ansible-playbook -vvv -i ${ROOTDIR}/operator/dev-hosts ${ROOTDIR}/operator/dev-playbook.yml
-
-## run-operator-playbook-tag: Run a tagged set of tasks via operator dev playbook to run parts of the operator ansible script locally.
-# To use this, add "tags: test" to one or more tasks - those are the tasks that will be run.
-run-operator-playbook-tag: .ensure-operator-repo-exists .ensure-operator-helm-chart-exists
-	ANSIBLE_ROLES_PATH=${ROOTDIR}/operator/roles ansible-playbook -vvv -i ${ROOTDIR}/operator/dev-hosts ${ROOTDIR}/operator/dev-playbook.yml --tags test
+ifeq ($(OPERATOR_PROFILER_ENABLED),true)
+	@$(eval ANSIBLE_CALLBACK_WHITELIST_ARG ?= ANSIBLE_CALLBACK_WHITELIST=profile_tasks)
+endif
+	@$(eval ANSIBLE_PYTHON_INTERPRETER ?= $(shell if (which python 2>/dev/null 1>&2 && python --version 2>&1 | grep -q " 2\.*"); then echo "-e ansible_python_interpreter=python3"; else echo ""; fi))
+	@if [ ! -z "${ANSIBLE_PYTHON_INTERPRETER}" ]; then echo "ANSIBLE_PYTHON_INTERPRETER is [${ANSIBLE_PYTHON_INTERPRETER}]. Make sure that refers to a Python3 installation. If you do not have Python3 in that location, you must ensure you have Python3 and ANSIBLE_PYTHON_INTERPRETER is set to '-e ansible_python_interpreter=<full path to your python3 executable>"; fi
+	@echo "Ensure the CRDs exist"; ${OC} apply -f ${HELM_CHARTS_REPO}/kiali-operator/crds/crds.yaml
+	@echo "Create a dummy Kiali CR"; ${OC} apply -f ${ROOTDIR}/operator/dev-playbook-config/dev-kiali-cr.yaml
+	ansible-galaxy collection install operator_sdk.util community.kubernetes
+	ALLOW_AD_HOC_KIALI_NAMESPACE=true ALLOW_AD_HOC_KIALI_IMAGE=true ANSIBLE_ROLES_PATH=${ROOTDIR}/operator/roles ${ANSIBLE_CALLBACK_WHITELIST_ARG} ansible-playbook -vvv ${ANSIBLE_PYTHON_INTERPRETER} -i ${ROOTDIR}/operator/dev-playbook-config/dev-hosts.yaml ${ROOTDIR}/operator/dev-playbook-config/dev-playbook.yaml
+	@echo "Remove the dummy Kiali CR"; ${OC} delete -f ${ROOTDIR}/operator/dev-playbook-config/dev-kiali-cr.yaml

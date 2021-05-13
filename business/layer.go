@@ -3,6 +3,8 @@ package business
 import (
 	"sync"
 
+	"k8s.io/client-go/tools/clientcmd/api"
+
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/jaeger"
 	"github.com/kiali/kiali/kubernetes"
@@ -13,20 +15,22 @@ import (
 
 // Layer is a container for fast access to inner services
 type Layer struct {
-	Svc            SvcService
-	Health         HealthService
-	Validations    IstioValidationsService
-	IstioConfig    IstioConfigService
-	Workload       WorkloadService
 	App            AppService
-	Namespace      NamespaceService
+	Health         HealthService
+	IstioConfig    IstioConfigService
+	IstioStatus    IstioStatusService
+	Iter8          Iter8Service
 	Jaeger         JaegerService
 	k8s            kubernetes.ClientInterface
+	Mesh           MeshService
+	Namespace      NamespaceService
 	OpenshiftOAuth OpenshiftOAuthService
-	TLS            TLSService
-	Iter8          Iter8Service
-	IstioStatus    IstioStatusService
 	ProxyStatus    ProxyStatus
+	Svc            SvcService
+	TLS            TLSService
+	TokenReview    TokenReviewService
+	Validations    IstioValidationsService
+	Workload       WorkloadService
 }
 
 // Global clientfactory and prometheus clients.
@@ -65,7 +69,7 @@ func IsResourceCached(namespace string, resource string) bool {
 }
 
 // Get the business.Layer
-func Get(token string) (*Layer, error) {
+func Get(authInfo *api.AuthInfo) (*Layer, error) {
 	// Kiali Cache will be initialized once at first use of Business layer
 	once.Do(initKialiCache)
 
@@ -79,7 +83,7 @@ func Get(token string) (*Layer, error) {
 	}
 
 	// Creates a new k8s client based on the current users token
-	k8s, err := clientFactory.GetClient(token)
+	k8s, err := clientFactory.GetClient(authInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +99,7 @@ func Get(token string) (*Layer, error) {
 
 	// Create Jaeger client
 	jaegerLoader := func() (jaeger.ClientInterface, error) {
-		return jaeger.NewClient(token)
+		return jaeger.NewClient(authInfo.Token)
 	}
 
 	return NewWithBackends(k8s, prometheusClient, jaegerLoader), nil
@@ -111,20 +115,22 @@ func SetWithBackends(cf kubernetes.ClientFactory, prom prometheus.ClientInterfac
 // NewWithBackends creates the business layer using the passed k8s and prom clients
 func NewWithBackends(k8s kubernetes.ClientInterface, prom prometheus.ClientInterface, jaegerClient JaegerLoader) *Layer {
 	temporaryLayer := &Layer{}
-	temporaryLayer.Health = HealthService{prom: prom, k8s: k8s, businessLayer: temporaryLayer}
-	temporaryLayer.Svc = SvcService{prom: prom, k8s: k8s, businessLayer: temporaryLayer}
-	temporaryLayer.IstioConfig = IstioConfigService{k8s: k8s, businessLayer: temporaryLayer}
-	temporaryLayer.Workload = WorkloadService{k8s: k8s, prom: prom, businessLayer: temporaryLayer}
-	temporaryLayer.Validations = IstioValidationsService{k8s: k8s, businessLayer: temporaryLayer}
 	temporaryLayer.App = AppService{prom: prom, k8s: k8s, businessLayer: temporaryLayer}
-	temporaryLayer.Namespace = NewNamespaceService(k8s)
+	temporaryLayer.Health = HealthService{prom: prom, k8s: k8s, businessLayer: temporaryLayer}
+	temporaryLayer.IstioConfig = IstioConfigService{k8s: k8s, businessLayer: temporaryLayer}
+	temporaryLayer.IstioStatus = IstioStatusService{k8s: k8s, businessLayer: temporaryLayer}
+	temporaryLayer.Iter8 = Iter8Service{k8s: k8s, businessLayer: temporaryLayer}
 	temporaryLayer.Jaeger = JaegerService{loader: jaegerClient, businessLayer: temporaryLayer}
 	temporaryLayer.k8s = k8s
+	temporaryLayer.Mesh = NewMeshService(k8s, temporaryLayer, nil)
+	temporaryLayer.Namespace = NewNamespaceService(k8s)
 	temporaryLayer.OpenshiftOAuth = OpenshiftOAuthService{k8s: k8s}
+	temporaryLayer.ProxyStatus = ProxyStatus{k8s: k8s, businessLayer: temporaryLayer}
+	temporaryLayer.Svc = SvcService{prom: prom, k8s: k8s, businessLayer: temporaryLayer}
 	temporaryLayer.TLS = TLSService{k8s: k8s, businessLayer: temporaryLayer}
-	temporaryLayer.Iter8 = Iter8Service{k8s: k8s, businessLayer: temporaryLayer}
-	temporaryLayer.IstioStatus = IstioStatusService{k8s: k8s}
-	temporaryLayer.ProxyStatus = ProxyStatus{k8s: k8s}
+	temporaryLayer.TokenReview = NewTokenReview(k8s)
+	temporaryLayer.Validations = IstioValidationsService{k8s: k8s, businessLayer: temporaryLayer}
+	temporaryLayer.Workload = WorkloadService{k8s: k8s, prom: prom, businessLayer: temporaryLayer}
 
 	return temporaryLayer
 }
